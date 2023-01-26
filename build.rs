@@ -201,6 +201,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         println!("cargo:warning=added {} ({}) to bundle with CID {}", name, id, cid);
     }
+
+    // Bundle IPC actors
+    const IPC_ACTORS: &[(&Package, u32)] = &[("ipcgw", 13), ("ipcsa", 14)];
+    let ipc_actors_dir = String::from("./output");
+
+    for &(pkg, id) in IPC_ACTORS.iter() {
+        // ipc-gateway
+        let bytecode_path = Path::new(&ipc_actors_dir).join(format!("{}.wasm", &pkg));
+
+        let cid = bundler
+            .add_from_file(id, pkg.clone().into(), None, &bytecode_path)
+            .unwrap_or_else(|err| {
+                panic!("failed to add file {:?} to bundle for actor {}: {}", bytecode_path, id, err)
+            });
+        println!("cargo:warning=added {} ({}) to bundle with CID {}", pkg, id, cid);
+    }
+
     bundler.finish().expect("failed to finish bundle");
 
     println!("cargo:warning=bundle={}", dst.display());
