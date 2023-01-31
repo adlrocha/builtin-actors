@@ -40,6 +40,8 @@ const EXTRA_CARGO_FEATURES: &[(&str, &[&str])] = &[("devnet-wasm", &["m2-native"
 
 const NETWORK_ENV: &str = "BUILD_FIL_NETWORK";
 
+const IPC_ACTORS_ENV: &str = "IPC_ACTORS_PATH";
+
 /// Returns the configured network name, checking both the environment and feature flags.
 fn network_name() -> String {
     let env_network = std::env::var_os(NETWORK_ENV);
@@ -180,7 +182,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let dst = Path::new(&out_dir).join("bundle.car");
     let mut bundler = Bundler::new(&dst);
+    let mut last_id = 0;
     for (&(pkg, name), id) in ACTORS.iter().zip(1u32..) {
+        last_id = id;
         assert_eq!(
             name,
             Type::from_u32(id).expect("type not defined").name(),
@@ -203,19 +207,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Bundle IPC actors
-    const IPC_ACTORS: &[(&Package, u32)] = &[("ipcgw", 13), ("ipcsa", 14)];
-    let ipc_actors_dir = String::from("./output");
+    const IPC_ACTORS: &[&Package] = &["ipc_gateway", "ipc_subnet_actor", "ipc_atomic_execution"];
+    let ipc_actors_dir = std::env::var_os(IPC_ACTORS_ENV)
+        .expect("set IPC_ACTORS_PATH env variable pointing to the directory with IPC actors build");
 
-    for &(pkg, id) in IPC_ACTORS.iter() {
+    for &pkg in IPC_ACTORS.iter() {
+        last_id += 1;
         // ipc-gateway
         let bytecode_path = Path::new(&ipc_actors_dir).join(format!("{}.wasm", &pkg));
 
         let cid = bundler
-            .add_from_file(id, pkg.clone().into(), None, &bytecode_path)
+            .add_from_file(last_id, pkg.clone().into(), None, &bytecode_path)
             .unwrap_or_else(|err| {
-                panic!("failed to add file {:?} to bundle for actor {}: {}", bytecode_path, id, err)
+                panic!(
+                    "failed to add file {:?} to bundle for actor {}: {}",
+                    bytecode_path, last_id, err
+                )
             });
-        println!("cargo:warning=added {} ({}) to bundle with CID {}", pkg, id, cid);
+        println!("cargo:warning=added {} ({}) to bundle with CID {}", pkg, last_id, cid);
     }
 
     bundler.finish().expect("failed to finish bundle");
