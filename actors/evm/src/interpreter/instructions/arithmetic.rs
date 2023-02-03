@@ -1,4 +1,4 @@
-use {crate::interpreter::uints::*, crate::interpreter::U256};
+use fil_actors_evm_shared::uints::{U256, U512};
 
 #[inline]
 pub fn add(a: U256, b: U256) -> U256 {
@@ -28,7 +28,7 @@ pub fn div(a: U256, b: U256) -> U256 {
 
 #[inline]
 pub fn sdiv(a: U256, b: U256) -> U256 {
-    i256_div(a, b)
+    a.i256_div(&b)
 }
 
 #[inline]
@@ -42,7 +42,7 @@ pub fn modulo(a: U256, b: U256) -> U256 {
 
 #[inline]
 pub fn smod(a: U256, b: U256) -> U256 {
-    i256_mod(a, b)
+    a.i256_mod(&b)
 }
 
 #[inline]
@@ -111,8 +111,8 @@ pub fn exp(mut base: U256, power: U256) -> U256 {
 #[cfg(test)]
 mod test {
     mod basic {
-        use crate::interpreter::instructions::arithmetic::*;
-        use crate::interpreter::U256;
+        use super::super::*;
+        use fil_actors_evm_shared::uints::U256;
 
         #[test]
         fn test_addmod() {
@@ -195,6 +195,23 @@ mod test {
                 div((u128::MAX).into(), 2.into()),
                 U256::from(u128::MAX / 2),
                 "divide 2^128 by 2 (uses >1 limb)"
+            );
+        }
+
+        #[test]
+        fn test_modulo() {
+            assert_eq!(modulo(0.into(), 0.into()), 0, "nothing mod nothing is nothing");
+            assert_eq!(modulo(4.into(), 1.into()), 0, "4 mod 1 is 0");
+            assert_eq!(
+                modulo((u128::MAX).into(), 2.into()),
+                U256::from(u128::MAX % 2),
+                "2^128 mod 2"
+            );
+
+            assert_eq!(
+                modulo((u128::MAX).into(), 7.into()),
+                U256::from(u128::MAX % 7),
+                "2^128 mod 7"
             );
         }
 

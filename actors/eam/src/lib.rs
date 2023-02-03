@@ -1,5 +1,6 @@
 use std::iter;
 
+use fil_actors_evm_shared::address::EthAddress;
 use num_traits::Zero;
 
 use ext::{
@@ -7,7 +8,9 @@ use ext::{
     evm::RESURRECT_METHOD,
     init::{Exec4Params, Exec4Return},
 };
-use fil_actors_runtime::{actor_dispatch_unrestricted, deserialize_block, AsActorError};
+use fil_actors_runtime::{
+    actor_dispatch_unrestricted, deserialize_block, extract_send_result, AsActorError,
+};
 
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_shared::{error::ExitCode, sys::SendFlags};
@@ -66,38 +69,6 @@ pub fn compute_address_create_external(rt: &impl Runtime, from: &EthAddress) -> 
     compute_address_create(rt, from, rt.message().nonce())
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EthAddress(#[serde(with = "strict_bytes")] pub [u8; 20]);
-
-impl EthAddress {
-    /// Returns true if the EthAddress refers to an address in the precompile range.
-    /// [reference](https://github.com/filecoin-project/ref-fvm/issues/1164#issuecomment-1371304676)
-    #[inline]
-    fn is_precompile(&self) -> bool {
-        // Exact index is not checked since it is unknown to the EAM what precompiles exist in the EVM actor.
-        // 0 indexes of both ranges are not assignable as well but are _not_ precompile address.
-        let [prefix, middle @ .., _index] = self.0;
-        (prefix == 0xfe || prefix == 0x00) && middle == [0u8; 18]
-    }
-
-    /// Returns true if the EthAddress is an actor ID embedded in an eth address.
-    #[inline]
-    fn is_id(&self) -> bool {
-        self.0[0] == 0xff && self.0[1..12].iter().all(|&i| i == 0)
-    }
-
-    #[inline]
-    fn is_null(&self) -> bool {
-        self.0 == [0; 20]
-    }
-
-    /// Returns true if the EthAddress is "reserved" (cannot be assigned by the EAM).
-    #[inline]
-    fn is_reserved(&self) -> bool {
-        self.is_precompile() || self.is_id() || self.is_null()
-    }
-}
-
 #[derive(Serialize_tuple, Deserialize_tuple)]
 pub struct CreateParams {
     #[serde(with = "strict_bytes")]
@@ -151,6 +122,10 @@ fn hash_20(rt: &impl Runtime, data: &[u8]) -> [u8; 20] {
     rt.hash(SupportedHashes::Keccak256, data)[12..32].try_into().unwrap()
 }
 
+fn can_assign_address(addr: &EthAddress) -> bool {
+    !addr.is_precompile() && !addr.is_id() && !addr.is_null()
+}
+
 fn create_actor(
     rt: &mut impl Runtime,
     creator: EthAddress,
@@ -160,7 +135,7 @@ fn create_actor(
     // If the new address is reserved (an ID address, or a precompile), reject it. An attacker would
     // need to brute-force 96bits of a cryptographic hash and convince the target to use an attacker
     // chosen salt, but we might as well be safe.
-    if new_addr.is_reserved() {
+    if !can_assign_address(&new_addr) {
         return Err(ActorError::forbidden("cannot create address with a reserved prefix".into()));
     }
 
@@ -176,7 +151,12 @@ fn create_actor(
         match rt.resolve_builtin_actor_type(&caller_code_cid) {
             // If it's an EVM actor, resurrect it.
             Some(Type::EVM) => {
-                rt.send(&Address::new_id(id), RESURRECT_METHOD, constructor_params.into(), value)?;
+                extract_send_result(rt.send_simple(
+                    &Address::new_id(id),
+                    RESURRECT_METHOD,
+                    constructor_params.into(),
+                    value,
+                ))?;
                 return Ok(Return { actor_id: id, robust_address: None, eth_address: new_addr });
             }
             // If it's a Placeholder, continue on to create it.
@@ -198,12 +178,12 @@ fn create_actor(
         subaddress: new_addr.0.to_vec().into(),
     };
 
-    let ret: ext::init::Exec4Return = deserialize_block(rt.send(
+    let ret: ext::init::Exec4Return = deserialize_block(extract_send_result(rt.send_simple(
         &INIT_ACTOR_ADDR,
         ext::init::EXEC4_METHOD,
         IpldBlock::serialize_cbor(&init_params)?,
         value,
-    )?)?;
+    ))?)?;
 
     Ok(Return::from_exec4(ret, new_addr))
 }
@@ -226,7 +206,7 @@ fn resolve_caller_external(rt: &mut impl Runtime) -> Result<(EthAddress, EthAddr
     match rt.resolve_builtin_actor_type(&caller_code_cid) {
         Some(Type::Account) => {
             let result = rt
-                .send_generalized(
+                .send(
                     &caller,
                     PUBKEY_ADDRESS_METHOD,
                     None,
@@ -243,16 +223,13 @@ fn resolve_caller_external(rt: &mut impl Runtime) -> Result<(EthAddress, EthAddr
                 return Err(ActorError::checked(
                     result.exit_code,
                     "failed to retrieve account robust address".to_string(),
+                    None,
                 ));
             }
             let robust_addr: Address = deserialize_block(result.return_data)?;
             let robust_eth_bytes = hash_20(rt, &robust_addr.to_bytes());
 
-            let mut id_bytes = [0u8; 20];
-            id_bytes[0] = 0xff;
-            id_bytes[12..].copy_from_slice(&caller_id.to_be_bytes());
-
-            Ok((EthAddress(id_bytes), EthAddress(robust_eth_bytes)))
+            Ok((EthAddress::from_id(caller_id), EthAddress(robust_eth_bytes)))
         }
         Some(Type::EthAccount) => {
             let addr = resolve_eth_address(rt, caller_id)?;
@@ -352,22 +329,17 @@ mod test {
     #[test]
     fn test_create_actor_rejects() {
         let mut rt = MockRuntime::default();
-        let mut creator = EthAddress([0; 20]);
-        creator.0[0] = 0xff;
-        creator.0[19] = 0x1;
+        let creator = EthAddress::from_id(1);
 
         // Reject ID.
-        let mut new_addr = EthAddress([0; 20]);
-        new_addr.0[0] = 0xff;
-        new_addr.0[18] = 0x20;
-        new_addr.0[19] = 0x20;
+        let new_addr = EthAddress::from_id(8224);
         assert_eq!(
             ExitCode::USR_FORBIDDEN,
             create_actor(&mut rt, creator, new_addr, Vec::new()).unwrap_err().exit_code()
         );
 
         // Reject EVM Precompile.
-        let mut new_addr = EthAddress([0; 20]);
+        let mut new_addr = EthAddress::null();
         new_addr.0[19] = 0x20;
         assert_eq!(
             ExitCode::USR_FORBIDDEN,
@@ -382,7 +354,7 @@ mod test {
         );
 
         // Reject Null.
-        let new_addr = EthAddress([0; 20]);
+        let new_addr = EthAddress::null();
         assert_eq!(
             ExitCode::USR_FORBIDDEN,
             create_actor(&mut rt, creator, new_addr, Vec::new()).unwrap_err().exit_code()

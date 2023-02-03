@@ -1,8 +1,9 @@
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
-use fil_actors_runtime::{actor_error, runtime::EMPTY_ARR_CID, AsActorError, EAM_ACTOR_ID};
+use fil_actors_evm_shared::{address::EthAddress, uints::U256};
+use fil_actors_runtime::{
+    actor_error, extract_send_result, runtime::EMPTY_ARR_CID, AsActorError, EAM_ACTOR_ID,
+};
 use fvm_ipld_blockstore::Block;
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::CborStore;
@@ -21,10 +22,7 @@ use once_cell::unsync::OnceCell;
 use crate::state::{State, Tombstone};
 use crate::BytecodeHash;
 
-use super::{address::EthAddress, Bytecode};
-
 use {
-    crate::interpreter::U256,
     cid::Cid,
     fil_actors_runtime::{runtime::Runtime, ActorError},
     fvm_ipld_blockstore::Blockstore,
@@ -119,7 +117,7 @@ pub struct System<'r, RT: Runtime> {
 }
 
 impl<'r, RT: Runtime> System<'r, RT> {
-    fn new(rt: &'r mut RT, readonly: bool) -> Self
+    pub(crate) fn new(rt: &'r mut RT, readonly: bool) -> Self
     where
         RT::Blockstore: Clone,
     {
@@ -213,7 +211,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
 
     /// Transfers funds to the receiver. This doesn't bother saving/reloading state.
     pub fn transfer(&mut self, to: &Address, value: TokenAmount) -> Result<(), ActorError> {
-        self.rt.send(to, METHOD_SEND, None, value)?;
+        extract_send_result(self.rt.send_simple(to, METHOD_SEND, None, value))?;
         Ok(())
     }
 
@@ -233,7 +231,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
 
         // Don't bother reloading on abort, just return the error.
         if !result.exit_code.is_success() {
-            return Err(ActorError::checked_with_data(
+            return Err(ActorError::checked(
                 result.exit_code,
                 format!("failed to call {to} on method {method}"),
                 result.return_data,
@@ -259,7 +257,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
         send_flags: SendFlags,
     ) -> Result<Result<Response, ErrorNumber>, ActorError> {
         self.flush()?;
-        let result = self.rt.send_generalized(to, method, params, value, gas_limit, send_flags);
+        let result = self.rt.send(to, method, params, value, gas_limit, send_flags);
 
         // Reload on success, and only on success.
         match &result {
@@ -267,7 +265,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
             _ => {}
         }
 
-        Ok(result)
+        Ok(result.map_err(|e| e.0))
     }
 
     /// Flush the actor state (bytecode, nonce, and slots).
@@ -457,17 +455,5 @@ impl<'r, RT: Runtime> System<'r, RT> {
     pub fn mark_selfdestructed(&mut self) {
         self.saved_state_root = None;
         self.tombstone = Some(crate::current_tombstone(self.rt));
-    }
-}
-
-pub fn load_bytecode<BS: Blockstore>(bs: &BS, cid: &Cid) -> Result<Option<Bytecode>, ActorError> {
-    let bytecode = bs
-        .get(cid)
-        .context_code(ExitCode::USR_NOT_FOUND, "failed to read bytecode")?
-        .expect("bytecode not in state tree");
-    if bytecode.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Bytecode::new(bytecode)))
     }
 }

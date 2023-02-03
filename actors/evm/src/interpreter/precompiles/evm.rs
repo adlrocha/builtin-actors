@@ -1,5 +1,9 @@
 use std::ops::Range;
 
+use fil_actors_evm_shared::uints::{
+    byteorder::{ByteOrder, LE},
+    U256,
+};
 use fil_actors_runtime::runtime::Runtime;
 use fvm_shared::crypto::{
     hash::SupportedHashes,
@@ -7,9 +11,11 @@ use fvm_shared::crypto::{
 };
 use num_traits::{One, Zero};
 use substrate_bn::{pairing_batch, AffineG1, AffineG2, Fq, Fq2, Fr, Group, Gt, G1, G2};
-use uint::byteorder::{ByteOrder, LE};
 
-use crate::interpreter::{precompiles::PrecompileError, System, U256};
+use crate::{
+    interpreter::{precompiles::PrecompileError, System},
+    EVM_WORD_SIZE,
+};
 
 use super::{PrecompileContext, PrecompileResult};
 use crate::reader::ValueReader;
@@ -85,7 +91,7 @@ pub(super) fn ripemd160<RT: Runtime>(
     let mut out = vec![0; 12];
     let hash = system.rt.hash(SupportedHashes::Ripemd160, input);
     out.extend_from_slice(&hash);
-    debug_assert_eq!(out.len(), 32);
+    debug_assert_eq!(out.len(), EVM_WORD_SIZE);
     Ok(out)
 }
 
@@ -234,7 +240,7 @@ pub(super) fn ec_pairing<RT: Runtime>(
     let accumulated = pairing_batch(&groups);
 
     let paring_success = if accumulated == Gt::one() { U256::one() } else { U256::zero() };
-    let mut ret = [0u8; 32];
+    let mut ret = [0u8; EVM_WORD_SIZE];
     paring_success.to_big_endian(&mut ret);
     Ok(ret.to_vec())
 }
@@ -297,7 +303,7 @@ pub(super) fn blake2f<RT: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use crate::interpreter::instructions::call::CallKind;
+    use crate::interpreter::CallKind;
 
     use super::*;
     use fil_actors_runtime::test_utils::MockRuntime;

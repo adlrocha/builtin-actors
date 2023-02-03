@@ -1,20 +1,24 @@
+use fil_actors_evm_shared::address::EthAddress;
+use fil_actors_evm_shared::uints::U256;
 use fil_actors_runtime::{actor_error, AsActorError, EAM_ACTOR_ADDR, INIT_ACTOR_ADDR};
+use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::{strict_bytes, BytesDe, BytesSer};
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
-use interpreter::{address::EthAddress, system::load_bytecode};
 
-use crate::interpreter::output::Outcome;
+use crate::interpreter::Outcome;
 use crate::reader::ValueReader;
 
+#[doc(hidden)]
+pub mod ext;
 pub mod interpreter;
 pub(crate) mod reader;
 mod state;
 
 use {
-    crate::interpreter::{execute, Bytecode, ExecutionState, System, U256},
+    crate::interpreter::{execute, Bytecode, ExecutionState, System},
     bytes::Bytes,
     cid::Cid,
     fil_actors_runtime::{
@@ -45,6 +49,8 @@ pub const EVM_CONTRACT_SELFDESTRUCT_FAILED: ExitCode = ExitCode::new(40);
 const EVM_MAX_RESERVED_METHOD: u64 = 1023;
 pub const NATIVE_METHOD_SIGNATURE: &str = "handle_filecoin_method(uint64,uint64,bytes)";
 pub const NATIVE_METHOD_SELECTOR: [u8; 4] = [0x86, 0x8e, 0x10, 0xc4];
+
+const EVM_WORD_SIZE: usize = 32;
 
 #[test]
 fn test_method_selector() {
@@ -86,7 +92,19 @@ pub(crate) fn is_dead(rt: &impl Runtime, state: &State) -> bool {
     state.tombstone.map_or(false, |t| t != current_tombstone(rt))
 }
 
-pub fn initialize_evm_contract(
+fn load_bytecode(bs: &impl Blockstore, cid: &Cid) -> Result<Option<Bytecode>, ActorError> {
+    let bytecode = bs
+        .get(cid)
+        .context_code(ExitCode::USR_NOT_FOUND, "failed to read bytecode")?
+        .expect("bytecode not in state tree");
+    if bytecode.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Bytecode::new(bytecode)))
+    }
+}
+
+fn initialize_evm_contract(
     system: &mut System<impl Runtime>,
     caller: EthAddress,
     initcode: Vec<u8>,
@@ -298,15 +316,17 @@ impl EvmContractActor {
 
 /// Format "filecoin_native_method" input parameters.
 fn handle_filecoin_method_input(method: u64, codec: u64, params: &[u8]) -> Vec<u8> {
-    let static_args = [method, codec, 32 * 3 /* start of params */, params.len() as u64];
-    let total_words = static_args.len() + (params.len() / 32) + (params.len() % 32 > 0) as usize;
-    let len = 4 + total_words * 32;
+    let static_args =
+        [method, codec, EVM_WORD_SIZE as u64 * 3 /* start of params */, params.len() as u64];
+    let total_words =
+        static_args.len() + (params.len() / EVM_WORD_SIZE) + (params.len() % 32 > 0) as usize;
+    let len = 4 + total_words * EVM_WORD_SIZE;
     let mut buf = Vec::with_capacity(len);
     buf.extend_from_slice(&NATIVE_METHOD_SELECTOR);
     for n in static_args {
         // Left-pad to 32 bytes, then be-encode the value.
         let encoded = n.to_be_bytes();
-        buf.resize(buf.len() + (32 - encoded.len()), 0);
+        buf.resize(buf.len() + (EVM_WORD_SIZE - encoded.len()), 0);
         buf.extend_from_slice(&encoded);
     }
     // Extend with the params, then right-pad with zeros.

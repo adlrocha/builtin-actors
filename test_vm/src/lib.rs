@@ -18,7 +18,6 @@ use fil_actor_power::{Actor as PowerActor, Method as MethodPower, State as Power
 use fil_actor_reward::{Actor as RewardActor, State as RewardState};
 use fil_actor_system::{Actor as SystemActor, State as SystemState};
 use fil_actor_verifreg::{Actor as VerifregActor, State as VerifRegState};
-use fil_actors_runtime::actor_error;
 use fil_actors_runtime::cbor::serialize;
 use fil_actors_runtime::runtime::builtins::Type;
 use fil_actors_runtime::runtime::{
@@ -26,6 +25,7 @@ use fil_actors_runtime::runtime::{
     Verifier, EMPTY_ARR_CID,
 };
 use fil_actors_runtime::test_utils::*;
+use fil_actors_runtime::{actor_error, SendError};
 use fil_actors_runtime::{
     ActorError, BURNT_FUNDS_ACTOR_ADDR, CRON_ACTOR_ADDR, EAM_ACTOR_ADDR, FIRST_NON_SINGLETON_ADDR,
     INIT_ACTOR_ADDR, REWARD_ACTOR_ADDR, STORAGE_MARKET_ACTOR_ADDR, STORAGE_POWER_ACTOR_ADDR,
@@ -39,7 +39,8 @@ use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::tuple::*;
 use fvm_ipld_encoding::{CborStore, RawBytes};
 use fvm_ipld_hamt::{BytesKey, Hamt, Sha256};
-use fvm_shared::address::{Address, Payload};
+use fvm_shared::address::Address;
+use fvm_shared::address::Payload;
 use fvm_shared::bigint::Zero;
 use fvm_shared::chainid::ChainID;
 use fvm_shared::clock::ChainEpoch;
@@ -49,7 +50,7 @@ use fvm_shared::crypto::signature::{
     Signature, SECP_PUB_LEN, SECP_SIG_LEN, SECP_SIG_MESSAGE_HASH_SIZE,
 };
 use fvm_shared::econ::TokenAmount;
-use fvm_shared::error::{ErrorNumber, ExitCode};
+use fvm_shared::error::ExitCode;
 use fvm_shared::event::ActorEvent;
 use fvm_shared::piece::PieceInfo;
 use fvm_shared::randomness::Randomness;
@@ -253,19 +254,19 @@ impl<'bs> VM<'bs> {
             actor(*EAM_ACTOR_CODE_ID, EMPTY_ARR_CID, 0, TokenAmount::zero(), None),
         );
 
-        // burnt funds
-        let burnt_funds_head = v.put_store(&AccountState { address: BURNT_FUNDS_ACTOR_ADDR });
-        v.set_actor(
-            BURNT_FUNDS_ACTOR_ADDR,
-            actor(*ACCOUNT_ACTOR_CODE_ID, burnt_funds_head, 0, TokenAmount::zero(), None),
-        );
-
         // datacap
         let datacap_head =
             v.put_store(&DataCapState::new(&v.store, VERIFIED_REGISTRY_ACTOR_ADDR).unwrap());
         v.set_actor(
             DATACAP_TOKEN_ACTOR_ADDR,
             actor(*DATACAP_TOKEN_ACTOR_CODE_ID, datacap_head, 0, TokenAmount::zero(), None),
+        );
+
+        // burnt funds
+        let burnt_funds_head = v.put_store(&AccountState { address: BURNT_FUNDS_ACTOR_ADDR });
+        v.set_actor(
+            BURNT_FUNDS_ACTOR_ADDR,
+            actor(*ACCOUNT_ACTOR_CODE_ID, burnt_funds_head, 0, TokenAmount::zero(), None),
         );
 
         // create a faucet with 1 billion FIL for setting up test accounts
@@ -462,10 +463,10 @@ impl<'bs> VM<'bs> {
             msg,
             allow_side_effects: true,
             caller_validated: false,
+            read_only: false,
             policy: &Policy::default(),
             subinvocations: RefCell::new(vec![]),
             actor_exit: RefCell::new(None),
-            read_only: false,
         };
         let res = new_ctx.invoke_actor();
 
@@ -572,6 +573,9 @@ impl InternalMessage {
 }
 
 impl MessageInfo for InvocationCtx<'_, '_> {
+    fn nonce(&self) -> u64 {
+        self.top.originator_call_seq
+    }
     fn caller(&self) -> Address {
         self.msg.from
     }
@@ -586,10 +590,6 @@ impl MessageInfo for InvocationCtx<'_, '_> {
     }
     fn gas_premium(&self) -> TokenAmount {
         TokenAmount::zero()
-    }
-
-    fn nonce(&self) -> u64 {
-        self.top.originator_call_seq
     }
 }
 
@@ -673,13 +673,13 @@ impl<'invocation, 'bs> InvocationCtx<'invocation, 'bs> {
                 msg: new_actor_msg,
                 allow_side_effects: true,
                 caller_validated: false,
+                read_only: false,
                 policy: self.policy,
                 subinvocations: RefCell::new(vec![]),
                 actor_exit: RefCell::new(None),
-                read_only: false,
             };
             if is_account {
-                new_ctx.create_actor(*ACCOUNT_ACTOR_CODE_ID, target_id, Some(*target)).unwrap();
+                new_ctx.create_actor(*ACCOUNT_ACTOR_CODE_ID, target_id, None).unwrap();
                 let res = new_ctx.invoke();
                 let invoc = new_ctx.gather_trace(res);
                 RefMut::map(self.subinvocations.borrow_mut(), |subinvocs| {
@@ -790,7 +790,6 @@ impl<'invocation, 'bs> InvocationCtx<'invocation, 'bs> {
             Type::Power => PowerActor::invoke_method(self, self.msg.method, params),
             Type::PaymentChannel => PaychActor::invoke_method(self, self.msg.method, params),
             Type::VerifiedRegistry => VerifregActor::invoke_method(self, self.msg.method, params),
-            // Type::EVM => panic!("no EVM"),
             Type::DataCap => DataCapActor::invoke_method(self, self.msg.method, params),
             Type::Placeholder => {
                 Err(ActorError::unhandled_message("placeholder actors only handle method 0".into()))
@@ -836,11 +835,8 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
             }
             None => actor(code_id, EMPTY_ARR_CID, 0, TokenAmount::zero(), predictable_address),
             _ => {
-                // can happen if an actor is deployed to an f4 address.
-                return Err(ActorError::unchecked(
-                    ExitCode::USR_FORBIDDEN,
-                    "attempt to create new actor at existing address".to_string(),
-                ));
+                return Err(actor_error!(forbidden;
+                    "attempt to create new actor at existing address {}", addr));
             }
         };
 
@@ -851,6 +847,7 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
             ));
         }
 
+        self.top.new_actor_addr_count.replace_with(|old| *old + 1);
         self.v.set_actor(addr, actor);
         Ok(())
     }
@@ -994,7 +991,7 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
         self.v.get_actor(Address::new_id(id)).and_then(|act| act.predictable_address)
     }
 
-    fn send_generalized(
+    fn send(
         &self,
         to: &Address,
         method: MethodNum,
@@ -1002,13 +999,12 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
         value: TokenAmount,
         _gas_limit: Option<u64>,
         mut send_flags: SendFlags,
-    ) -> Result<Response, ErrorNumber> {
+    ) -> Result<Response, SendError> {
         // replicate FVM by silently propagating read only flag to subcalls
         if self.read_only() {
             send_flags.set(SendFlags::READ_ONLY, true)
         }
 
-        // TODO gas_limit is current ignored, what should we do about it?
         if !self.allow_side_effects {
             return Ok(Response { exit_code: ExitCode::SYS_ASSERTION_FAILED, return_data: None });
         }
@@ -1020,10 +1016,10 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
             msg: new_actor_msg,
             allow_side_effects: true,
             caller_validated: false,
+            read_only: send_flags.read_only(),
             policy: self.policy,
             subinvocations: RefCell::new(vec![]),
             actor_exit: RefCell::new(None),
-            read_only: send_flags.read_only(),
         };
         let res = new_ctx.invoke_actor();
         let invoc = new_ctx.gather_trace(res.clone());
@@ -1056,24 +1052,6 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
         Ok(TEST_VM_RAND_ARRAY)
     }
 
-    fn user_get_randomness_from_beacon(
-        &self,
-        _personalization: i64,
-        _epoch: ChainEpoch,
-        _entropy: &[u8],
-    ) -> Result<[u8; RANDOMNESS_LENGTH], ActorError> {
-        Ok(TEST_VM_RAND_ARRAY)
-    }
-
-    fn user_get_randomness_from_chain(
-        &self,
-        _personalization: i64,
-        _epoch: ChainEpoch,
-        _entropy: &[u8],
-    ) -> Result<[u8; RANDOMNESS_LENGTH], ActorError> {
-        Ok(TEST_VM_RAND_ARRAY)
-    }
-
     fn get_state_root(&self) -> Result<Cid, ActorError> {
         Ok(self.v.get_actor(self.to()).unwrap().head)
     }
@@ -1095,10 +1073,6 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
                 "actor is read-only".to_string(),
             )),
         }
-    }
-
-    fn state<T: DeserializeOwned>(&self) -> Result<T, ActorError> {
-        Ok(self.v.get_state::<T>(self.to()).unwrap())
     }
 
     fn transaction<S, RT, F>(&mut self, f: F) -> Result<RT, ActorError>
@@ -1128,9 +1102,7 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
     fn new_actor_address(&mut self) -> Result<Address, ActorError> {
         let mut b = self.top.originator_stable_addr.to_bytes();
         b.extend_from_slice(&self.top.originator_call_seq.to_be_bytes());
-        b.extend_from_slice(
-            &self.top.new_actor_addr_count.replace_with(|old| *old + 1).to_be_bytes(),
-        );
+        b.extend_from_slice(&self.top.new_actor_addr_count.borrow().to_be_bytes());
         Ok(Address::new_actor(&b))
     }
 
@@ -1168,8 +1140,8 @@ impl<'invocation, 'bs> Runtime for InvocationCtx<'invocation, 'bs> {
         0
     }
 
-    fn tipset_cid(&self, _epoch: i64) -> Option<Cid> {
-        Some(Cid::new_v1(IPLD_RAW, Multihash::wrap(0, b"faketipset").unwrap()))
+    fn tipset_cid(&self, _epoch: i64) -> Result<Cid, ActorError> {
+        Ok(Cid::new_v1(IPLD_RAW, Multihash::wrap(0, b"faketipset").unwrap()))
     }
 
     // TODO No support for events yet.

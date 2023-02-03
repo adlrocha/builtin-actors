@@ -8,10 +8,10 @@ use ethers::prelude::builders::ContractCall;
 use ethers::prelude::*;
 use ethers::providers::{MockProvider, Provider};
 use ethers::types::Bytes;
-use evm::interpreter::address::EthAddress;
-use evm::interpreter::U256;
 use evm::{Method, EVM_CONTRACT_REVERTED};
 use fil_actor_evm as evm;
+use fil_actors_evm_shared::address::EthAddress;
+use fil_actors_evm_shared::uints::U256;
 use fil_actors_runtime::{test_utils::*, EAM_ACTOR_ID, INIT_ACTOR_ADDR};
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::{BytesDe, BytesSer, CBOR, IPLD_RAW};
@@ -21,7 +21,7 @@ use fvm_shared::bigint::Zero;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
 use fvm_shared::sys::SendFlags;
-use fvm_shared::{ActorID, MethodNum, METHOD_SEND};
+use fvm_shared::{ActorID, MethodNum};
 use once_cell::sync::Lazy;
 
 mod util;
@@ -177,7 +177,7 @@ fn test_call() {
     let evm_target = EthAddress(hex_literal::hex!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"));
     let f4_target: FILAddress = evm_target.try_into().unwrap();
     rt.actor_code_cids.insert(target, *EVM_ACTOR_CODE_ID);
-    rt.add_delegated_address(target, f4_target);
+    rt.set_delegated_address(target.id().unwrap(), f4_target);
 
     let evm_target_word = evm_target.as_evm_word();
 
@@ -193,7 +193,7 @@ fn test_call() {
     return_data[31] = 0x42;
 
     rt.expect_gas_available(10_000_000_000u64);
-    rt.expect_send_generalized(
+    rt.expect_send(
         f4_target,
         evm::Method::InvokeContract as u64,
         proxy_call_input_data,
@@ -210,82 +210,11 @@ fn test_call() {
     assert_eq!(U256::from_big_endian(&result), U256::from(0x42));
 }
 
-// Test that a zero-value call to an actor that doesn't exist doesn't actually create the actor.
+const TRANSFER_GAS_VALUE: u64 = 10_000_000;
+
+// Make sure we set the correct gas limit with value and 0 gas.
 #[test]
-fn test_empty_call_no_side_effects() {
-    let contract = call_proxy_contract();
-
-    // construct the proxy
-    let mut rt = util::construct_and_verify(contract);
-
-    // create a mock target and proxy a call through the proxy
-    let evm_target = EthAddress(hex_literal::hex!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"));
-
-    let evm_target_word = evm_target.as_evm_word();
-
-    // dest + method 0 with no data
-    let mut contract_params = vec![0u8; 36];
-    evm_target_word.to_big_endian(&mut contract_params[..32]);
-
-    // expected return data
-    let mut return_data = vec![0u8; 32];
-    return_data[31] = 0x42;
-
-    let result = util::invoke_contract(&mut rt, &contract_params);
-    assert_eq!(U256::from_big_endian(&result), U256::from(0));
-    // Expect no calls
-    rt.verify();
-}
-
-// Make sure we do bare sends when calling accounts/placeholder, and make sure it works.
-#[test]
-fn test_call_convert_to_send() {
-    let contract = call_proxy_contract();
-
-    for code in [*ACCOUNT_ACTOR_CODE_ID, *PLACEHOLDER_ACTOR_CODE_ID] {
-        // construct the proxy
-        let mut rt = util::construct_and_verify(contract.clone());
-
-        // create a mock actor and proxy a call through the proxy
-        let target_id = 0x100;
-        let target = FILAddress::new_id(target_id);
-        rt.actor_code_cids.insert(target, code);
-
-        let evm_target_word = EthAddress::from_id(target_id).as_evm_word();
-
-        // dest + method 0 with no data
-        let mut contract_params = vec![0u8; 36];
-        evm_target_word.to_big_endian(&mut contract_params[..32]);
-
-        let proxy_call_contract_params = vec![0u8; 4];
-        let proxy_call_input_data = make_raw_params(proxy_call_contract_params);
-
-        // expected return data
-        let mut return_data = vec![0u8; 32];
-        return_data[31] = 0x42;
-
-        rt.expect_send_generalized(
-            target,
-            METHOD_SEND,
-            proxy_call_input_data,
-            TokenAmount::zero(),
-            None,
-            SendFlags::empty(),
-            IpldBlock::serialize_cbor(&BytesSer(&return_data))
-                .expect("failed to serialize return data"),
-            ExitCode::OK,
-            None,
-        );
-
-        let result = util::invoke_contract(&mut rt, &contract_params);
-        assert_eq!(U256::from_big_endian(&result), U256::from(0x42));
-        rt.verify();
-    }
-}
-
-// Make sure we do bare sends when calling with 0 gas and value
-#[test]
-fn test_call_convert_to_send2() {
+fn test_transfer_nogas() {
     let contract = call_proxy_transfer_contract();
 
     // construct the proxy
@@ -305,14 +234,18 @@ fn test_call_convert_to_send2() {
     // we don't expected return data
     let return_data = vec![];
 
+    rt.expect_gas_available(TRANSFER_GAS_VALUE * 10);
     rt.expect_send(
         target,
-        METHOD_SEND,
+        Method::InvokeContract as u64,
         None,
         TokenAmount::from_atto(0x42),
+        Some(TRANSFER_GAS_VALUE),
+        SendFlags::empty(),
         IpldBlock::serialize_cbor(&BytesSer(&return_data))
             .expect("failed to serialize return data"),
         ExitCode::OK,
+        None,
     );
 
     let result = util::invoke_contract(&mut rt, &contract_params);
@@ -320,9 +253,9 @@ fn test_call_convert_to_send2() {
     rt.verify();
 }
 
-// Make sure we do bare sends when calling with 2300 gas and no value
+// Make sure we set the correct gas limit with no value and 2300 gas.
 #[test]
-fn test_call_convert_to_send3() {
+fn test_transfer_2300() {
     let contract = call_proxy_gas2300_contract();
 
     // construct the proxy
@@ -342,14 +275,18 @@ fn test_call_convert_to_send3() {
     // we don't expected return data
     let return_data = vec![];
 
+    rt.expect_gas_available(TRANSFER_GAS_VALUE * 10);
     rt.expect_send(
         target,
-        METHOD_SEND,
+        Method::InvokeContract as u64,
         None,
         TokenAmount::zero(),
+        Some(TRANSFER_GAS_VALUE),
+        SendFlags::empty(),
         IpldBlock::serialize_cbor(&BytesSer(&return_data))
             .expect("failed to serialize return data"),
         ExitCode::OK,
+        None,
     );
 
     let result = util::invoke_contract(&mut rt, &contract_params);
@@ -364,7 +301,7 @@ pub fn test_call_output_region() {
 # this contract truncates return from send to output length
 
 # prepare the proxy call
-push1 0x00 
+push1 0x00
 calldataload # size from first word
 push1 0x00 # offset
 
@@ -401,7 +338,7 @@ return
 
     let cases = [(32, 64), (64, 64), (1024, 1025)];
     for (output_size, return_size) in cases {
-        rt.expect_send_generalized(
+        rt.expect_send(
             (&address).try_into().unwrap(),
             Method::InvokeContract as u64,
             None,
@@ -472,14 +409,14 @@ fn test_native_call() {
     assert_eq!(result, Some(IpldBlock { codec: CBOR, data: "foobar".into() }));
 
     rt.expect_validate_caller_any();
-    let err = rt.call::<evm::EvmContractActor>(1026, None).unwrap_err();
+    let mut err = rt.call::<evm::EvmContractActor>(1026, None).unwrap_err();
     assert_eq!(err.exit_code().value(), 42);
-    assert!(err.data().is_empty());
+    assert!(err.take_data().is_none());
 
     rt.expect_validate_caller_any();
-    let err = rt.call::<evm::EvmContractActor>(1027, None).unwrap_err();
+    let mut err = rt.call::<evm::EvmContractActor>(1027, None).unwrap_err();
     assert_eq!(err.exit_code().value(), 42);
-    assert_eq!(err.data(), &b"foobar"[..]);
+    assert_eq!(err.take_data().unwrap().data, &b"foobar"[..]);
 }
 
 #[test]
@@ -598,7 +535,7 @@ fn test_callactor_inner(method_num: MethodNum, exit_code: ExitCode, valid_call_i
 
     if valid_call_input {
         // We only get to the send_generalized if the call params were valid
-        rt.expect_send_generalized(
+        rt.expect_send(
             target,
             method_num,
             make_raw_params(proxy_call_input_data),
@@ -678,7 +615,7 @@ fn call_actor_weird_offset() {
         input,
     };
 
-    rt.expect_send_generalized(
+    rt.expect_send(
         addr,
         0,
         None,
@@ -729,7 +666,7 @@ fn call_actor_overlapping() {
         input: call_params.clone().into(),
     };
 
-    rt.expect_send_generalized(
+    rt.expect_send(
         addr,
         0,
         Some(IpldBlock { codec: CBOR, data: addr_bytes }),
@@ -772,7 +709,7 @@ fn call_actor_id_with_full_address() {
         input: call_params.clone().into(),
     };
 
-    rt.expect_send_generalized(
+    rt.expect_send(
         Address::new_id(actual_id_addr),
         0,
         None,
@@ -818,7 +755,7 @@ fn call_actor_syscall_error() {
         ..Default::default()
     };
 
-    rt.expect_send_generalized(
+    rt.expect_send(
         addr,
         0,
         None,
@@ -1108,7 +1045,7 @@ fn call_actor_solidity() {
             CONTRACT.call_actor_id(0, ethers::types::U256::zero(), 0, 0, Bytes::default(), 101);
 
         let expected_return = vec![0xff, 0xfe];
-        tester.rt.expect_send_generalized(
+        tester.rt.expect_send(
             Address::new_id(101),
             0,
             None,
@@ -1133,9 +1070,9 @@ fn call_actor_solidity() {
     {
         log::warn!("new test");
         // EVM actor
-        let evm_target = FILAddress::new_id(10101);
+        let evm_target = 10101;
         let evm_del = EthAddress(util::CONTRACT_ADDRESS).try_into().unwrap();
-        tester.rt.add_delegated_address(evm_target, evm_del);
+        tester.rt.set_delegated_address(evm_target, evm_del);
 
         let to_address = {
             let subaddr = hex_literal::hex!("b0ba000000000000000000000000000000000000");
@@ -1151,7 +1088,7 @@ fn call_actor_solidity() {
         );
 
         let expected_return = vec![0xff, 0xfe];
-        tester.rt.expect_send_generalized(
+        tester.rt.expect_send(
             to_address,
             0,
             None,
@@ -1194,7 +1131,7 @@ fn call_actor_send_solidity() {
         tester.rt.add_balance(TokenAmount::from_atto(100));
 
         let expected_return = vec![0xff, 0xfe];
-        tester.rt.expect_send_generalized(
+        tester.rt.expect_send(
             Address::new_id(101),
             0,
             None,
@@ -1239,10 +1176,7 @@ impl ContractTester {
 
         rt.set_origin(FILAddress::new_id(0));
         // first actor created is 0
-        rt.add_delegated_address(
-            Address::new_id(0),
-            Address::new_delegated(EAM_ACTOR_ID, &addr.0).unwrap(),
-        );
+        rt.set_delegated_address(0, Address::new_delegated(EAM_ACTOR_ID, &addr.0).unwrap());
 
         assert!(rt
             .call::<evm::EvmContractActor>(

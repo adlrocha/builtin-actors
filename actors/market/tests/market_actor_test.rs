@@ -6,8 +6,8 @@ use fil_actor_market::policy::detail::DEAL_MAX_LABEL_SIZE;
 use fil_actor_market::{
     deal_id_key, ext, ActivateDealsParams, Actor as MarketActor, ClientDealProposal, DealArray,
     DealMetaArray, Label, MarketNotifyDealParams, Method, PublishStorageDealsParams,
-    PublishStorageDealsReturn, State, WithdrawBalanceParams, MARKET_NOTIFY_DEAL_METHOD,
-    NO_ALLOCATION_ID, PROPOSALS_AMT_BITWIDTH, STATES_AMT_BITWIDTH,
+    PublishStorageDealsReturn, State, WithdrawBalanceParams, EX_DEAL_EXPIRED,
+    MARKET_NOTIFY_DEAL_METHOD, NO_ALLOCATION_ID, PROPOSALS_AMT_BITWIDTH, STATES_AMT_BITWIDTH,
 };
 use fil_actors_runtime::cbor::{deserialize, serialize};
 use fil_actors_runtime::network::EPOCHS_IN_DAY;
@@ -747,7 +747,7 @@ fn deal_expires() {
     )[0];
 
     rt.set_epoch(start_epoch + EPOCHS_IN_DAY + 1);
-    rt.expect_send(
+    rt.expect_send_simple(
         BURNT_FUNDS_ACTOR_ADDR,
         METHOD_SEND,
         None,
@@ -842,7 +842,7 @@ fn provider_and_client_addresses_are_resolved_before_persisting_state_and_sent_t
     rt.set_caller(*ACCOUNT_ACTOR_CODE_ID, WORKER_ADDR);
     rt.expect_validate_caller_any();
 
-    expect_provider_control_address(&mut rt, provider_resolved, OWNER_ADDR, WORKER_ADDR);
+    expect_provider_is_control_address(&mut rt, provider_resolved, WORKER_ADDR, true);
     expect_query_network_info(&mut rt);
 
     //  create a client proposal with a valid signature
@@ -861,7 +861,7 @@ fn provider_and_client_addresses_are_resolved_before_persisting_state_and_sent_t
     })
     .unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         deal.client,
         AUTHENTICATE_MESSAGE_METHOD,
         auth_param,
@@ -884,7 +884,7 @@ fn provider_and_client_addresses_are_resolved_before_persisting_state_and_sent_t
     };
     let balance_of_params = client_resolved;
     let balance_of_return = TokenAmount::from_whole(2048);
-    rt.expect_send(
+    rt.expect_send_simple(
         DATACAP_TOKEN_ACTOR_ADDR,
         ext::datacap::BALANCE_OF_METHOD as u64,
         IpldBlock::serialize_cbor(&balance_of_params).unwrap(),
@@ -914,7 +914,7 @@ fn provider_and_client_addresses_are_resolved_before_persisting_state_and_sent_t
         )
         .unwrap(),
     };
-    rt.expect_send(
+    rt.expect_send_simple(
         DATACAP_TOKEN_ACTOR_ADDR,
         ext::datacap::TRANSFER_FROM_METHOD as u64,
         IpldBlock::serialize_cbor(&transfer_params).unwrap(),
@@ -932,7 +932,7 @@ fn provider_and_client_addresses_are_resolved_before_persisting_state_and_sent_t
         deal_id,
     })
     .unwrap();
-    rt.expect_send(
+    rt.expect_send_simple(
         client_resolved,
         MARKET_NOTIFY_DEAL_METHOD,
         notify_param,
@@ -1362,7 +1362,7 @@ fn fail_when_deal_is_activated_but_proposal_is_not_found() {
     delete_deal_proposal(&mut rt, deal_id);
 
     rt.set_epoch(process_epoch(start_epoch, deal_id));
-    expect_abort(ExitCode::USR_NOT_FOUND, cron_tick_raw(&mut rt));
+    expect_abort(EX_DEAL_EXPIRED, cron_tick_raw(&mut rt));
 
     check_state_with_expected(
         &rt,
@@ -1481,7 +1481,7 @@ fn slash_a_deal_and_make_payment_for_another_deal_in_the_same_epoch() {
     terminate_deals(&mut rt, PROVIDER_ADDR, &[deal_id1]);
 
     // cron tick will slash deal1 and make payment for deal2
-    rt.expect_send(
+    rt.expect_send_simple(
         BURNT_FUNDS_ACTOR_ADDR,
         METHOD_SEND,
         None,
@@ -1526,7 +1526,7 @@ fn cannot_publish_the_same_deal_twice_before_a_cron_tick() {
         deals: vec![ClientDealProposal { proposal: d2.clone(), client_signature: sig }],
     };
     rt.expect_validate_caller_any();
-    expect_provider_control_address(&mut rt, PROVIDER_ADDR, OWNER_ADDR, WORKER_ADDR);
+    expect_provider_is_control_address(&mut rt, PROVIDER_ADDR, WORKER_ADDR, true);
     expect_query_network_info(&mut rt);
     rt.set_caller(*ACCOUNT_ACTOR_CODE_ID, WORKER_ADDR);
 
@@ -1536,7 +1536,7 @@ fn cannot_publish_the_same_deal_twice_before_a_cron_tick() {
     })
     .unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         d2.client,
         AUTHENTICATE_MESSAGE_METHOD,
         auth_param,
@@ -1733,7 +1733,7 @@ fn locked_fund_tracking_states() {
     // make payment for p1 and p2, p3 times out as it has not been activated
     let curr = process_epoch(start_epoch, deal_id3);
     rt.set_epoch(curr);
-    rt.expect_send(
+    rt.expect_send_simple(
         BURNT_FUNDS_ACTOR_ADDR,
         METHOD_SEND,
         None,
@@ -1774,7 +1774,7 @@ fn locked_fund_tracking_states() {
     csf = TokenAmount::zero();
     clc = TokenAmount::zero();
     plc = TokenAmount::zero();
-    rt.expect_send(
+    rt.expect_send_simple(
         BURNT_FUNDS_ACTOR_ADDR,
         METHOD_SEND,
         None,
@@ -1941,7 +1941,7 @@ fn insufficient_client_balance_in_a_batch() {
     };
 
     rt.expect_validate_caller_any();
-    expect_provider_control_address(&mut rt, PROVIDER_ADDR, OWNER_ADDR, WORKER_ADDR);
+    expect_provider_is_control_address(&mut rt, PROVIDER_ADDR, WORKER_ADDR, true);
     expect_query_network_info(&mut rt);
 
     let authenticate_param1 = IpldBlock::serialize_cbor(&AuthenticateMessageParams {
@@ -1955,7 +1955,7 @@ fn insufficient_client_balance_in_a_batch() {
     })
     .unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         deal1.client,
         AUTHENTICATE_MESSAGE_METHOD as u64,
         authenticate_param1,
@@ -1963,7 +1963,7 @@ fn insufficient_client_balance_in_a_batch() {
         None,
         ExitCode::OK,
     );
-    rt.expect_send(
+    rt.expect_send_simple(
         deal2.client,
         AUTHENTICATE_MESSAGE_METHOD as u64,
         authenticate_param2,
@@ -1978,7 +1978,7 @@ fn insufficient_client_balance_in_a_batch() {
         deal_id: next_deal_id,
     })
     .unwrap();
-    rt.expect_send(
+    rt.expect_send_simple(
         deal2.client,
         MARKET_NOTIFY_DEAL_METHOD,
         notify_param2,
@@ -2075,7 +2075,7 @@ fn insufficient_provider_balance_in_a_batch() {
     };
 
     rt.expect_validate_caller_any();
-    expect_provider_control_address(&mut rt, PROVIDER_ADDR, OWNER_ADDR, WORKER_ADDR);
+    expect_provider_is_control_address(&mut rt, PROVIDER_ADDR, WORKER_ADDR, true);
     expect_query_network_info(&mut rt);
 
     let authenticate_param1 = IpldBlock::serialize_cbor(&AuthenticateMessageParams {
@@ -2089,7 +2089,7 @@ fn insufficient_provider_balance_in_a_batch() {
     })
     .unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         deal1.client,
         AUTHENTICATE_MESSAGE_METHOD as u64,
         authenticate_param1,
@@ -2097,7 +2097,7 @@ fn insufficient_provider_balance_in_a_batch() {
         None,
         ExitCode::OK,
     );
-    rt.expect_send(
+    rt.expect_send_simple(
         deal2.client,
         AUTHENTICATE_MESSAGE_METHOD as u64,
         authenticate_param2,
@@ -2112,7 +2112,7 @@ fn insufficient_provider_balance_in_a_batch() {
         deal_id: next_deal_id,
     })
     .unwrap();
-    rt.expect_send(
+    rt.expect_send_simple(
         deal2.client,
         MARKET_NOTIFY_DEAL_METHOD,
         notify_param2,
@@ -2235,10 +2235,10 @@ fn psd_restricted_correctly() {
     .unwrap();
 
     rt.expect_validate_caller_any();
-    expect_provider_control_address(&mut rt, PROVIDER_ADDR, OWNER_ADDR, WORKER_ADDR);
+    expect_provider_is_control_address(&mut rt, PROVIDER_ADDR, WORKER_ADDR, true);
     expect_query_network_info(&mut rt);
 
-    rt.expect_send(
+    rt.expect_send_simple(
         deal.client,
         AUTHENTICATE_MESSAGE_METHOD as u64,
         authenticate_param1,
@@ -2252,7 +2252,7 @@ fn psd_restricted_correctly() {
         deal_id: next_deal_id,
     })
     .unwrap();
-    rt.expect_send(
+    rt.expect_send_simple(
         deal.client,
         MARKET_NOTIFY_DEAL_METHOD,
         notify_param,

@@ -1,8 +1,9 @@
-#![allow(dead_code, clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc)]
 
+use fil_actors_evm_shared::uints::U256;
 use fil_actors_runtime::{ActorError, AsActorError};
 
-use crate::{interpreter::U256, EVM_CONTRACT_STACK_OVERFLOW, EVM_CONTRACT_STACK_UNDERFLOW};
+use crate::{EVM_CONTRACT_STACK_OVERFLOW, EVM_CONTRACT_STACK_UNDERFLOW};
 
 /// Ethereum Yellow Paper (9.1)
 pub const STACK_SIZE: usize = 1024;
@@ -145,6 +146,19 @@ fn test_stack_push_pop() {
     stack.push(2.into()).unwrap();
     assert_eq!(stack.pop().unwrap(), 2);
     assert_eq!(stack.pop().unwrap(), 1);
+}
+
+#[test]
+fn test_stack_drop() {
+    let mut stack = Stack::new();
+    stack.push(1.into()).unwrap();
+    stack.push(2.into()).unwrap();
+    stack.drop().unwrap();
+    stack.drop().unwrap();
+    assert_eq!(
+        stack.drop().expect_err("expect underflow").exit_code(),
+        EVM_CONTRACT_STACK_UNDERFLOW
+    );
 }
 
 #[test]

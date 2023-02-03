@@ -1,17 +1,18 @@
 use crate::interpreter::instructions::memory::get_memory_region;
+use fil_actors_evm_shared::uints::U256;
 use fil_actors_runtime::ActorError;
 use fvm_ipld_encoding::{to_vec, BytesSer, RawBytes};
 use fvm_shared::event::{Entry, Flags};
 use {
-    crate::interpreter::{ExecutionState, System, U256},
+    crate::interpreter::{ExecutionState, System},
     fil_actors_runtime::runtime::Runtime,
 };
 
 /// The event key for the Ethereum log data.
-const EVENT_DATA_KEY: &str = "data";
+const EVENT_DATA_KEY: &str = "d";
 
 /// The event keys for the Ethereum log topics.
-const EVENT_TOPIC_KEYS: &[&str] = &["topic1", "topic2", "topic3", "topic4"];
+const EVENT_TOPIC_KEYS: &[&str] = &["t1", "t2", "t3", "t4"];
 
 #[inline]
 pub fn log(
@@ -39,7 +40,7 @@ pub fn log(
         let key = EVENT_TOPIC_KEYS[i];
         let topic = topics[i];
         let entry = Entry {
-            flags: Flags::FLAG_INDEXED_VALUE,
+            flags: Flags::FLAG_INDEXED_ALL,
             key: (*key).to_owned(),
             value: to_vec(&topic)?.into(), // U256 serializes as a byte string.
         };
@@ -50,7 +51,7 @@ pub fn log(
     if let Some(r) = region {
         let data = state.memory[r.offset..r.offset + r.size.get()].to_vec();
         let entry = Entry {
-            flags: Flags::FLAG_INDEXED_VALUE,
+            flags: Flags::FLAG_INDEXED_ALL,
             key: EVENT_DATA_KEY.to_owned(),
             value: RawBytes::serialize(BytesSer(&data))?,
         };

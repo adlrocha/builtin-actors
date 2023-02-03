@@ -1,10 +1,9 @@
 use eam::ext::evm::RESURRECT_METHOD;
 use eam::ext::init::{Exec4Params, Exec4Return, EXEC4_METHOD};
-use eam::{
-    compute_address_create, Create2Params, CreateParams, EthAddress, EvmConstructorParams, Return,
-};
+use eam::{compute_address_create, Create2Params, CreateParams, EvmConstructorParams, Return};
 use fil_actor_eam as eam;
 use fil_actor_eam::CreateExternalParams;
+use fil_actors_evm_shared::address::EthAddress;
 use fil_actors_runtime::runtime::builtins::Type;
 use fil_actors_runtime::runtime::Primitives;
 use fil_actors_runtime::test_utils::{
@@ -23,9 +22,9 @@ fn call_create_new() {
     let mut rt = construct_and_verify();
 
     let id_addr = Address::new_id(110);
-    let eth_addr = eam::EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
+    let eth_addr = EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
     let f4_eth_addr = Address::new_delegated(10, &eth_addr.0).unwrap();
-    rt.add_delegated_address(id_addr, f4_eth_addr);
+    rt.set_delegated_address(id_addr.id().unwrap(), f4_eth_addr);
 
     rt.set_caller(*EVM_ACTOR_CODE_ID, id_addr);
 
@@ -50,7 +49,7 @@ fn call_create_new() {
     })
     .unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         INIT_ACTOR_ADDR,
         EXEC4_METHOD,
         IpldBlock::serialize_cbor(&params).unwrap(),
@@ -84,10 +83,9 @@ fn call_create_external_over_placeholder() {
     let mut rt = construct_and_verify();
 
     let caller_id_addr = Address::new_id(110);
-    let caller_eth_addr =
-        eam::EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
+    let caller_eth_addr = EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
     let caller_f4_eth_addr = Address::new_delegated(10, &caller_eth_addr.0).unwrap();
-    rt.add_delegated_address(caller_id_addr, caller_f4_eth_addr);
+    rt.set_delegated_address(caller_id_addr.id().unwrap(), caller_f4_eth_addr);
 
     // Accounts and EthAccounts are the valid caller types for CreateExternal
     rt.set_caller(*ETHACCOUNT_ACTOR_CODE_ID, caller_id_addr);
@@ -96,7 +94,7 @@ fn call_create_external_over_placeholder() {
     let target_id_addr = Address::new_id(111);
     let target_eth_addr = compute_address_create(&rt, &caller_eth_addr, 0);
     let target_f4_eth_addr = Address::new_delegated(10, &target_eth_addr.0).unwrap();
-    rt.add_delegated_address(target_id_addr, target_f4_eth_addr);
+    rt.set_delegated_address(target_id_addr.id().unwrap(), target_f4_eth_addr);
     rt.set_address_actor_type(target_id_addr, *PLACEHOLDER_ACTOR_CODE_ID);
 
     let initcode = vec![0xff];
@@ -117,7 +115,7 @@ fn call_create_external_over_placeholder() {
     };
     let send_return_ser = IpldBlock::serialize_cbor(&send_return).unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         INIT_ACTOR_ADDR,
         EXEC4_METHOD,
         IpldBlock::serialize_cbor(&params).unwrap(),
@@ -152,17 +150,16 @@ fn call_resurrect() {
     let mut rt = construct_and_verify();
 
     let caller_id_addr = Address::new_id(110);
-    let caller_eth_addr =
-        eam::EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
+    let caller_eth_addr = EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
     let caller_f4_eth_addr = Address::new_delegated(10, &caller_eth_addr.0).unwrap();
-    rt.add_delegated_address(caller_id_addr, caller_f4_eth_addr);
+    rt.set_delegated_address(caller_id_addr.id().unwrap(), caller_f4_eth_addr);
 
     rt.set_caller(*EVM_ACTOR_CODE_ID, caller_id_addr);
 
     let target_id_addr = Address::new_id(111);
     let target_eth_addr = compute_address_create(&rt, &caller_eth_addr, 0);
     let target_f4_eth_addr = Address::new_delegated(10, &target_eth_addr.0).unwrap();
-    rt.add_delegated_address(target_id_addr, target_f4_eth_addr);
+    rt.set_delegated_address(target_id_addr.id().unwrap(), target_f4_eth_addr);
     rt.set_address_actor_type(target_id_addr, *EVM_ACTOR_CODE_ID);
 
     rt.expect_validate_caller_type(vec![Type::EVM]);
@@ -173,7 +170,7 @@ fn call_resurrect() {
 
     let params = EvmConstructorParams { creator: caller_eth_addr, initcode: initcode.into() };
 
-    rt.expect_send(
+    rt.expect_send_simple(
         target_id_addr,
         RESURRECT_METHOD,
         IpldBlock::serialize_cbor(&params).unwrap(),
@@ -204,9 +201,9 @@ fn call_create2() {
     let mut rt = construct_and_verify();
 
     let id_addr = Address::new_id(110);
-    let eth_addr = eam::EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
+    let eth_addr = EthAddress(hex_literal::hex!("CAFEB0BA00000000000000000000000000000000"));
     let f4_eth_addr = Address::new_delegated(10, &eth_addr.0).unwrap();
-    rt.add_delegated_address(id_addr, f4_eth_addr);
+    rt.set_delegated_address(id_addr.id().unwrap(), f4_eth_addr);
 
     rt.set_caller(*EVM_ACTOR_CODE_ID, id_addr);
     rt.expect_validate_caller_type(vec![Type::EVM]);
@@ -236,7 +233,7 @@ fn call_create2() {
     })
     .unwrap();
 
-    rt.expect_send(
+    rt.expect_send_simple(
         INIT_ACTOR_ADDR,
         EXEC4_METHOD,
         IpldBlock::serialize_cbor(&params).unwrap(),

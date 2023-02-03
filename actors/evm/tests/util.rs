@@ -1,8 +1,8 @@
 use cid::Cid;
-use evm::interpreter::address::EthAddress;
-use evm::interpreter::U256;
 use fil_actor_evm as evm;
 use fil_actor_evm::State;
+use fil_actors_evm_shared::address::EthAddress;
+use fil_actors_evm_shared::uints::U256;
 use fil_actors_runtime::runtime::Runtime;
 use fil_actors_runtime::{
     test_utils::{self, *},
@@ -42,10 +42,7 @@ pub fn init_construct_and_verify<F: FnOnce(&mut MockRuntime)>(
     initrt(&mut rt);
 
     // first actor created is 0
-    rt.add_delegated_address(
-        Address::new_id(0),
-        Address::new_delegated(EAM_ACTOR_ID, &CONTRACT_ADDRESS).unwrap(),
-    );
+    rt.set_delegated_address(0, Address::new_delegated(EAM_ACTOR_ID, &CONTRACT_ADDRESS).unwrap());
     rt.set_address_actor_type(Address::new_id(0), *EVM_ACTOR_CODE_ID);
 
     let params = evm::ConstructorParams {
@@ -126,6 +123,7 @@ pub enum PrecompileCallOpcode {
     DelegateCall,
     StaticCall,
 }
+
 impl PrecompileCallOpcode {
     fn dispatch_num(&self) -> u8 {
         match self {

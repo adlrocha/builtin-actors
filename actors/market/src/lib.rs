@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cid::multihash::{Code, MultihashDigest, MultihashGeneric};
 use cid::Cid;
-use fil_actors_runtime::FIRST_ACTOR_SPECIFIC_EXIT_CODE;
+use fil_actors_runtime::{extract_send_result, FIRST_ACTOR_SPECIFIC_EXIT_CODE};
 use frc46_token::token::types::{BalanceReturn, TransferFromParams, TransferFromReturn};
 use fvm_ipld_bitfield::BitField;
 use fvm_ipld_blockstore::Blockstore;
@@ -151,7 +151,12 @@ impl Actor {
             Ok(ex)
         })?;
 
-        rt.send(&recipient, METHOD_SEND, None, amount_extracted.clone())?;
+        extract_send_result(rt.send_simple(
+            &recipient,
+            METHOD_SEND,
+            None,
+            amount_extracted.clone(),
+        ))?;
 
         Ok(WithdrawBalanceReturn { amount_withdrawn: amount_extracted })
     }
@@ -210,16 +215,17 @@ impl Actor {
             ));
         }
 
-        let (_, worker, controllers) = request_miner_control_addrs(rt, provider_id)?;
         let caller = rt.message().caller();
-        let mut caller_ok = caller == worker;
-        for controller in controllers.iter() {
-            if caller_ok {
-                break;
-            }
-            caller_ok = caller == *controller;
-        }
-        if !caller_ok {
+        let caller_status: ext::miner::IsControllingAddressReturn =
+            deserialize_block(extract_send_result(rt.send_simple(
+                &Address::new_id(provider_id),
+                ext::miner::IS_CONTROLLING_ADDRESS_EXPORTED,
+                IpldBlock::serialize_cbor(&ext::miner::IsControllingAddressParam {
+                    address: caller,
+                })?,
+                TokenAmount::zero(),
+            ))?)?;
+        if !caller_status.is_controlling {
             return Err(actor_error!(
                 forbidden,
                 "caller {} is not worker or control address of provider {}",
@@ -440,7 +446,7 @@ impl Actor {
 
         // notify clients ignoring any errors
         for (i, valid_deal) in valid_deals.iter().enumerate() {
-            _ = rt.send(
+            _ = extract_send_result(rt.send_simple(
                 &valid_deal.proposal.client,
                 MARKET_NOTIFY_DEAL_METHOD,
                 IpldBlock::serialize_cbor(&MarketNotifyDealParams {
@@ -448,7 +454,7 @@ impl Actor {
                     deal_id: new_deal_ids[i],
                 })?,
                 TokenAmount::zero(),
-            );
+            ));
         }
 
         Ok(PublishStorageDealsReturn { ids: new_deal_ids, valid_deals: valid_input_bf })
@@ -476,6 +482,7 @@ impl Actor {
             validate_and_return_deal_space(
                 &proposals,
                 &sector.deal_ids,
+                st.next_id,
                 &miner_addr,
                 sector.sector_expiry,
                 curr_epoch,
@@ -510,6 +517,7 @@ impl Actor {
             validate_and_return_deal_space(
                 &proposals,
                 &params.deal_ids,
+                st.next_id,
                 &miner_addr,
                 params.sector_expiry,
                 curr_epoch,
@@ -536,9 +544,7 @@ impl Actor {
                     ));
                 }
 
-                let proposal = st
-                    .find_proposal(rt.store(), deal_id)?
-                    .ok_or_else(|| actor_error!(not_found, "no such deal_id: {}", deal_id))?;
+                let proposal = st.get_proposal(rt.store(), deal_id)?;
 
                 let propc = rt_deal_cid(rt, &proposal)?;
 
@@ -690,9 +696,7 @@ impl Actor {
                 let deal_ids = st.get_deals_for_epoch(rt.store(), i)?;
 
                 for deal_id in deal_ids {
-                    let deal = st.find_proposal(rt.store(), deal_id)?.ok_or_else(|| {
-                        actor_error!(not_found, "proposal doesn't exist ({})", deal_id)
-                    })?;
+                    let deal = st.get_proposal(rt.store(), deal_id)?;
 
                     let dcid = rt_deal_cid(rt, &deal)?;
 
@@ -843,7 +847,12 @@ impl Actor {
         })?;
 
         if !amount_slashed.is_zero() {
-            rt.send(&BURNT_FUNDS_ACTOR_ADDR, METHOD_SEND, None, amount_slashed)?;
+            extract_send_result(rt.send_simple(
+                &BURNT_FUNDS_ACTOR_ADDR,
+                METHOD_SEND,
+                None,
+                amount_slashed,
+            ))?;
         }
         Ok(())
     }
@@ -963,7 +972,6 @@ impl Actor {
                 terminated: state.slash_epoch,
             }),
             None => {
-                // State::get_proposal will fail with USR_NOT_FOUND in either case.
                 let maybe_proposal = st.find_proposal(rt.store(), params.id)?;
                 match maybe_proposal {
                     Some(_) => Ok(GetDealActivationReturn {
@@ -1019,6 +1027,7 @@ fn compute_data_commitment<BS: Blockstore>(
 pub fn validate_and_return_deal_space<BS: Blockstore>(
     proposals: &DealArray<BS>,
     deal_ids: &[DealID],
+    next_id: DealID,
     miner_addr: &Address,
     sector_expiry: ChainEpoch,
     sector_activation: ChainEpoch,
@@ -1040,7 +1049,13 @@ pub fn validate_and_return_deal_space<BS: Blockstore>(
         let proposal = proposals
             .get(*deal_id)
             .context_code(ExitCode::USR_ILLEGAL_STATE, "failed to load deal")?
-            .ok_or_else(|| actor_error!(not_found, "no such deal {}", deal_id))?;
+            .ok_or_else(|| {
+                if deal_id < &next_id {
+                    ActorError::unchecked(EX_DEAL_EXPIRED, format!("deal {} expired", deal_id))
+                } else {
+                    actor_error!(not_found, "no such deal {}", deal_id)
+                }
+            })?;
 
         validate_deal_can_activate(proposal, miner_addr, sector_expiry, sector_activation)
             .with_context(|| format!("cannot activate deal {}", deal_id))?;
@@ -1111,14 +1126,13 @@ fn transfer_from(
     rt: &mut impl Runtime,
     params: TransferFromParams,
 ) -> Result<Vec<AllocationID>, ActorError> {
-    let ret = rt
-        .send(
-            &DATACAP_TOKEN_ACTOR_ADDR,
-            ext::datacap::TRANSFER_FROM_METHOD as u64,
-            IpldBlock::serialize_cbor(&params)?,
-            TokenAmount::zero(),
-        )
-        .context(format!("failed to send transfer to datacap {:?}", params))?;
+    let ret = extract_send_result(rt.send_simple(
+        &DATACAP_TOKEN_ACTOR_ADDR,
+        ext::datacap::TRANSFER_FROM_METHOD as u64,
+        IpldBlock::serialize_cbor(&params)?,
+        TokenAmount::zero(),
+    ))
+    .context(format!("failed to send transfer to datacap {:?}", params))?;
     let ret: TransferFromReturn = ret
         .with_context_code(ExitCode::USR_ASSERTION_FAILED, || "return expected".to_string())?
         .deserialize()?;
@@ -1130,14 +1144,13 @@ fn transfer_from(
 // Invokes BalanceOf on the data cap token actor.
 fn balance_of(rt: &mut impl Runtime, owner: &Address) -> Result<TokenAmount, ActorError> {
     let params = IpldBlock::serialize_cbor(owner)?;
-    let ret = rt
-        .send(
-            &DATACAP_TOKEN_ACTOR_ADDR,
-            ext::datacap::BALANCE_OF_METHOD as u64,
-            params,
-            TokenAmount::zero(),
-        )
-        .context(format!("failed to query datacap balance of {}", owner))?;
+    let ret = extract_send_result(rt.send_simple(
+        &DATACAP_TOKEN_ACTOR_ADDR,
+        ext::datacap::BALANCE_OF_METHOD as u64,
+        params,
+        TokenAmount::zero(),
+    ))
+    .context(format!("failed to query datacap balance of {}", owner))?;
     let ret: BalanceReturn = ret
         .with_context_code(ExitCode::USR_ASSERTION_FAILED, || "return expected".to_string())?
         .deserialize()?;
@@ -1280,7 +1293,7 @@ fn deal_proposal_is_internally_valid(
     // Generate unsigned bytes
     let proposal_bytes = serialize(&proposal.proposal, "deal proposal")?;
 
-    rt.send(
+    extract_send_result(rt.send_simple(
         &proposal.proposal.client,
         ext::account::AUTHENTICATE_MESSAGE_METHOD,
         IpldBlock::serialize_cbor(&ext::account::AuthenticateMessageParams {
@@ -1288,7 +1301,7 @@ fn deal_proposal_is_internally_valid(
             message: proposal_bytes.to_vec(),
         })?,
         TokenAmount::zero(),
-    )
+    ))
     .map_err(|e| e.wrap("proposal authentication failed"))?;
     Ok(())
 }
@@ -1323,12 +1336,13 @@ fn request_miner_control_addrs(
     rt: &mut impl Runtime,
     miner_id: ActorID,
 ) -> Result<(Address, Address, Vec<Address>), ActorError> {
-    let addrs: ext::miner::GetControlAddressesReturnParams = deserialize_block(rt.send(
-        &Address::new_id(miner_id),
-        ext::miner::CONTROL_ADDRESSES_METHOD,
-        None,
-        TokenAmount::zero(),
-    )?)?;
+    let addrs: ext::miner::GetControlAddressesReturnParams =
+        deserialize_block(extract_send_result(rt.send_simple(
+            &Address::new_id(miner_id),
+            ext::miner::CONTROL_ADDRESSES_METHOD,
+            None,
+            TokenAmount::zero(),
+        ))?)?;
 
     Ok((addrs.owner, addrs.worker, addrs.control_addresses))
 }
@@ -1361,12 +1375,12 @@ fn escrow_address(
 
 /// Requests the current epoch target block reward from the reward actor.
 fn request_current_baseline_power(rt: &mut impl Runtime) -> Result<StoragePower, ActorError> {
-    let ret: ThisEpochRewardReturn = deserialize_block(rt.send(
+    let ret: ThisEpochRewardReturn = deserialize_block(extract_send_result(rt.send_simple(
         &REWARD_ACTOR_ADDR,
         ext::reward::THIS_EPOCH_REWARD_METHOD,
         None,
         TokenAmount::zero(),
-    )?)?;
+    ))?)?;
     Ok(ret.this_epoch_baseline_power)
 }
 
@@ -1375,12 +1389,13 @@ fn request_current_baseline_power(rt: &mut impl Runtime) -> Result<StoragePower,
 fn request_current_network_power(
     rt: &mut impl Runtime,
 ) -> Result<(StoragePower, StoragePower), ActorError> {
-    let ret: ext::power::CurrentTotalPowerReturnParams = deserialize_block(rt.send(
-        &STORAGE_POWER_ACTOR_ADDR,
-        ext::power::CURRENT_TOTAL_POWER_METHOD,
-        None,
-        TokenAmount::zero(),
-    )?)?;
+    let ret: ext::power::CurrentTotalPowerReturnParams =
+        deserialize_block(extract_send_result(rt.send_simple(
+            &STORAGE_POWER_ACTOR_ADDR,
+            ext::power::CURRENT_TOTAL_POWER_METHOD,
+            None,
+            TokenAmount::zero(),
+        ))?)?;
     Ok((ret.raw_byte_power, ret.quality_adj_power))
 }
 

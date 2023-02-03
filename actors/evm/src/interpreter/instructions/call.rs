@@ -1,35 +1,32 @@
 #![allow(clippy::too_many_arguments)]
 
+use fil_actors_evm_shared::{address::EthAddress, uints::U256};
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::BytesDe;
-use fvm_shared::{address::Address, sys::SendFlags, IPLD_RAW, METHOD_SEND};
+use fvm_shared::{address::Address, sys::SendFlags, MethodNum, IPLD_RAW};
 
-use crate::interpreter::precompiles::{is_reserved_precompile_address, PrecompileContext};
+use crate::interpreter::{
+    precompiles::{is_reserved_precompile_address, PrecompileContext},
+    CallKind,
+};
 
 use super::ext::{get_contract_type, get_evm_bytecode_cid, ContractType};
 
 use {
     super::memory::{copy_to_memory, get_memory_region},
-    crate::interpreter::address::EthAddress,
     crate::interpreter::instructions::memory::MemoryRegion,
     crate::interpreter::precompiles,
     crate::interpreter::ExecutionState,
     crate::interpreter::System,
-    crate::interpreter::U256,
     crate::{DelegateCallParams, Method},
-    fil_actors_runtime::runtime::builtins::Type,
     fil_actors_runtime::runtime::Runtime,
     fil_actors_runtime::ActorError,
     fvm_shared::econ::TokenAmount,
+    fvm_shared::error::ErrorNumber,
 };
 
-/// The kind of call-like instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallKind {
-    Call,
-    DelegateCall,
-    StaticCall,
-}
+/// The gas granted on bare "transfers".
+const TRANSFER_GAS_LIMIT: U256 = U256::from_u64(10_000_000);
 
 pub fn calldataload(
     state: &mut ExecutionState,
@@ -42,8 +39,8 @@ pub fn calldataload(
         .ok()
         .filter(|&start| start < input_len)
         .map(|start: usize| {
-            let end = core::cmp::min(start.saturating_add(32usize), input_len);
-            let mut data = [0; 32];
+            let end = core::cmp::min(start.saturating_add(crate::EVM_WORD_SIZE), input_len);
+            let mut data = [0; crate::EVM_WORD_SIZE];
             data[..end - start].copy_from_slice(&state.input_data[start..end]);
             U256::from_big_endian(&data)
         })
@@ -156,7 +153,7 @@ pub fn call_generic<RT: Runtime>(
 ) -> Result<U256, ActorError> {
     let ExecutionState { stack: _, memory, .. } = state;
 
-    let (gas, dst, value, input_offset, input_size, output_offset, output_size) = params;
+    let (mut gas, dst, value, input_offset, input_size, output_offset, output_size) = params;
 
     if system.readonly && value > U256::zero() {
         // non-zero sends are side-effects and hence a static mode violation
@@ -203,61 +200,65 @@ pub fn call_generic<RT: Runtime>(
             let call_result = match kind {
                 CallKind::Call | CallKind::StaticCall => {
                     let dst_addr: Address = dst.into();
-
-                    // Special casing for account/placeholder/non-existent actors: we just do a SEND (method 0)
-                    // which allows us to transfer funds (and create placeholders)
-                    let target_actor_code = system
-                        .rt
-                        .resolve_address(&dst_addr)
-                        .and_then(|actor_id| system.rt.get_actor_code_cid(&actor_id));
-                    let target_actor_type = target_actor_code
-                        .as_ref()
-                        .and_then(|cid| system.rt.resolve_builtin_actor_type(cid));
-                    let actor_exists = target_actor_code.is_some();
-
-                    if !actor_exists && value.is_zero() {
-                        // If the actor doesn't exist and we're not sending value, return with
-                        // "success". The EVM only auto-creates actors when sending value.
-                        //
-                        // NOTE: this will also apply if we're in read-only mode, because we can't
-                        // send value in read-only mode anyways.
-                        Ok(None)
+                    if (gas == 0 && value > 0) || (gas == 2300 && value == 0) {
+                        // We provide enough gas for the transfer to succeed in all case.
+                        gas = TRANSFER_GAS_LIMIT;
+                    }
+                    let gas_limit = Some(effective_gas_limit(system, gas));
+                    let params = if input_data.is_empty() {
+                        None
                     } else {
-                        let (method, gas_limit) = if !actor_exists
-                            || matches!(target_actor_type, Some(Type::Placeholder | Type::Account | Type::EthAccount))
-                            // See https://github.com/filecoin-project/ref-fvm/issues/980 for this
-                            // hocus pocus
-                            || (input_data.is_empty() && ((gas == 0 && value > 0) || (gas == 2300 && value == 0)))
-                        {
-                            // We switch to a bare send when:
+                        Some(IpldBlock { codec: IPLD_RAW, data: input_data.into() })
+                    };
+                    let value = TokenAmount::from(&value);
+                    let send_flags = if kind == CallKind::StaticCall {
+                        SendFlags::READ_ONLY
+                    } else {
+                        SendFlags::default()
+                    };
+                    // Error cases:
+                    //
+                    // 1. If the outer result fails, it means we failed to flush/restore state and
+                    // there is a bug. We exit with an actor error and abort.
+                    match system.send_raw(
+                        &dst_addr,
+                        Method::InvokeContract as MethodNum,
+                        params,
+                        value,
+                        gas_limit,
+                        send_flags,
+                    )? {
+                        Ok(resp) => {
+                            if resp.exit_code.is_success() {
+                                Ok(resp.return_data)
+                            } else {
+                                Err(resp.return_data)
+                            }
+                        }
+                        Err(e) => match e {
+                            // The target actor doesn't exist. To match EVM behavior, we walk away.
+                            ErrorNumber::NotFound => Ok(None),
+                            // If we hit this case, we must have tried to auto-deploy an actor
+                            // while read-only. We've already checked that we aren't trying to
+                            // transfer funds.
                             //
-                            // 1. The target is a placeholder/account or doesn't exist. Otherwise,
-                            // sending funds to an account/placeholder would fail when we try to call
-                            // InvokeContract.
-                            // 2. The gas wouldn't let code execute anyways. This lets us support
-                            // solidity's "transfer" method.
-                            //
-                            // At the same time, we ignore the supplied gas value and set it to
-                            // infinity as user code won't execute anyways. The only code that might
-                            // run is related to account creation, which doesn't count against this
-                            // gas limit in the EVM anyways.
-                            (METHOD_SEND, None)
-                        } else {
-                            // Otherwise, invoke normally.
-                            (Method::InvokeContract as u64, Some(effective_gas_limit(system, gas)))
-                        };
-                        let params = if input_data.is_empty() {
-                            None
-                        } else {
-                            Some(IpldBlock { codec: IPLD_RAW, data: input_data.into() })
-                        };
-                        let value = TokenAmount::from(&value);
-                        let send_flags = if kind == CallKind::StaticCall {
-                            SendFlags::READ_ONLY
-                        } else {
-                            SendFlags::default()
-                        };
-                        system.send(&dst_addr, method, params, value, gas_limit, send_flags)
+                            // To match EVM behavior, we treat this case as "success" and
+                            // walk away.
+                            ErrorNumber::ReadOnly
+                                if system.readonly || kind == CallKind::StaticCall =>
+                            {
+                                Ok(None)
+                            }
+                            ErrorNumber::InsufficientFunds => Err(None),
+                            ErrorNumber::LimitExceeded => Err(None),
+                            // Nothing else is expected in this case. This likely indicates a bug, but
+                            // it doesn't indicate that there's an issue with _this_ EVM actor, so we
+                            // might as log and well continue.
+                            e => {
+                                log::error!("unexpected syscall error on CALL to {dst_addr}: {e}");
+                                Err(None)
+                            }
+                        },
                     }
                 }
                 CallKind::DelegateCall => match get_contract_type(system.rt, &dst) {
@@ -271,14 +272,16 @@ pub fn call_generic<RT: Runtime>(
                                 caller: state.caller,
                                 value: state.value_received.clone(),
                             };
-                            system.send(
-                                &system.rt.message().receiver(),
-                                Method::InvokeContractDelegate as u64,
-                                IpldBlock::serialize_dag_cbor(&params)?,
-                                TokenAmount::from(&value),
-                                Some(effective_gas_limit(system, gas)),
-                                SendFlags::default(),
-                            )
+                            system
+                                .send(
+                                    &system.rt.message().receiver(),
+                                    Method::InvokeContractDelegate as u64,
+                                    IpldBlock::serialize_dag_cbor(&params)?,
+                                    TokenAmount::from(&value),
+                                    Some(effective_gas_limit(system, gas)),
+                                    SendFlags::default(),
+                                )
+                                .map_err(|mut ae| ae.take_data())
                         } else {
                             // If it doesn't have code, short-circuit and return immediately.
                             Ok(None)
@@ -289,17 +292,18 @@ pub fn call_generic<RT: Runtime>(
                     ContractType::Account | ContractType::NotFound => Ok(None),
                     // If we're calling a "native" actor, always revert.
                     ContractType::Native(_) => {
-                        Err(ActorError::forbidden("cannot delegate-call to native actors".into()))
+                        log::info!("attempted to delegatecall a native actor at {dst:?}");
+                        Err(None)
                     }
-                    ContractType::Precompile => Err(ActorError::assertion_failed(
-                        "Reached a precompile address in DelegateCall when a precompile should've been caught earlier in the system"
-                            .to_string(),
-                    )),
+                    ContractType::Precompile => {
+                        log::error!("reached a precompile address in DelegateCall when a precompile should've been caught earlier in the system");
+                        Err(None)
+                    }
                 },
             };
             let (code, data) = match call_result {
                 Ok(result) => (1, result),
-                Err(mut ae) => (0, ae.take_data()),
+                Err(result) => (0, result),
             };
 
             (
@@ -332,4 +336,135 @@ fn effective_gas_limit<RT: Runtime>(system: &System<RT>, gas: U256) -> u64 {
     let gas_rsvp = (63 * system.rt.gas_available()) / 64;
     let gas = gas.to_u64_saturating();
     std::cmp::min(gas, gas_rsvp)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::evm_unit_test;
+    use fil_actors_evm_shared::uints::U256;
+
+    #[test]
+    fn test_calldataload() {
+        // happy path
+        evm_unit_test! {
+            (m) {
+                CALLDATALOAD;
+            }
+            m.state.input_data = vec![0x00, 0x01, 0x02].into();
+            m.state.stack.push(U256::from(1)).unwrap();
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), U256::from(0x0102) << 240);
+        };
+    }
+
+    #[test]
+    fn test_calldataload_oob() {
+        // tsests admissibility of out of bounds reads (as 0s)
+        evm_unit_test! {
+            (m) {
+                CALLDATALOAD;
+            }
+            m.state.input_data = vec![0x00, 0x01, 0x02].into();
+            m.state.stack.push(U256::from(10)).unwrap();
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), U256::zero());
+        };
+    }
+
+    #[test]
+    fn test_calldataload_large_input() {
+        // tests admissibility of subset of data reads
+        evm_unit_test! {
+            (m) {
+                CALLDATALOAD;
+            }
+            let mut input_data = [0u8;64];
+            input_data[0] = 0x42;
+            m.state.input_data = Vec::from(input_data).into();
+            m.state.stack.push(U256::from(0)).unwrap();
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), U256::from(0x42) << 248);
+        };
+    }
+
+    #[test]
+    fn test_calldatasize() {
+        evm_unit_test! {
+            (m) {
+                CALLDATASIZE;
+            }
+            m.state.input_data = vec![0x00, 0x01, 0x02].into();
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), U256::from(3));
+        };
+    }
+
+    #[test]
+    fn test_calldatacopy() {
+        // happy path
+        evm_unit_test! {
+            (m) {
+                CALLDATACOPY;
+            }
+            m.state.input_data = vec![0x00, 0x01, 0x02].into();
+            m.state.stack.push(U256::from(2)).unwrap();  // length
+            m.state.stack.push(U256::from(1)).unwrap();  // offset
+            m.state.stack.push(U256::from(0)).unwrap();  // dest-offset
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 0);
+            let mut expected = [0u8; 32];
+            expected[0] = 0x01;
+            expected[1] = 0x02;
+            assert_eq!(m.state.memory.as_ref(), &expected);
+        };
+    }
+
+    #[test]
+    fn test_calldatacopy_oob() {
+        // tests admissibility of large (oob) lengths; should give zeros.
+        evm_unit_test! {
+            (m) {
+                CALLDATACOPY;
+            }
+            m.state.input_data = vec![0x00, 0x01, 0x02].into();
+            m.state.stack.push(U256::from(64)).unwrap(); // length -- too big
+            m.state.stack.push(U256::from(1)).unwrap();  // offset
+            m.state.stack.push(U256::from(0)).unwrap();  // dest-offset
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 0);
+            let mut expected = [0u8; 64];
+            expected[0] = 0x01;
+            expected[1] = 0x02;
+            assert_eq!(m.state.memory.as_ref(), &expected);
+        };
+    }
+
+    #[test]
+    fn test_calldatacopy_oob2() {
+        // test admissibility of large (oob) offsetes -- should give zeros.
+        evm_unit_test! {
+            (m) {
+                CALLDATACOPY;
+            }
+            m.state.input_data = vec![0x00, 0x01, 0x02].into();
+            m.state.stack.push(U256::from(2)).unwrap();   // length
+            m.state.stack.push(U256::from(10)).unwrap();  // offset -- out of bounds
+            m.state.stack.push(U256::from(0)).unwrap();   // dest-offset
+            let result = m.step();
+            assert!(result.is_ok(), "execution step failed");
+            assert_eq!(m.state.stack.len(), 0);
+            let expected = [0u8; 32];
+            assert_eq!(m.state.memory.as_ref(), &expected);
+        };
+    }
 }
