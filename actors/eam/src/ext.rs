@@ -29,11 +29,14 @@ pub mod init {
 
 pub mod evm {
     use super::*;
+    use fil_actors_evm_shared::address::EthAddress;
 
-    #[derive(Serialize_tuple, Deserialize_tuple)]
+    #[derive(Serialize_tuple, Deserialize_tuple, Clone)]
     pub struct ConstructorParams {
-        pub bytecode: RawBytes,
-        pub input_data: RawBytes,
+        /// The actor's "creator" (specified by the EAM).
+        pub creator: EthAddress,
+        /// The initcode that will construct the new EVM actor.
+        pub initcode: RawBytes,
     }
 
     pub const RESURRECT_METHOD: u64 = 2;

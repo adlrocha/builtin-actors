@@ -12,8 +12,8 @@ use cid::Cid;
 use fvm_ipld_blockstore::{Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::de::DeserializeOwned;
 use fvm_ipld_encoding::CborStore;
-use fvm_shared::address::{Address, Payload, Protocol};
-use fvm_shared::chainid::ChainID;
+use fvm_shared::address::Payload;
+use fvm_shared::address::{Address, Protocol};
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::commcid::{FIL_COMMITMENT_SEALED, FIL_COMMITMENT_UNSEALED};
 use fvm_shared::consensus::ConsensusFault;
@@ -44,10 +44,11 @@ use crate::runtime::{
     Verifier, EMPTY_ARR_CID,
 };
 use crate::{actor_error, ActorError, SendError};
-use fvm_shared::event::ActorEvent;
 use libsecp256k1::{recover, Message, RecoveryId, Signature as EcsdaSignature};
 
 use fvm_ipld_encoding::ipld_block::IpldBlock;
+use fvm_shared::chainid::ChainID;
+use fvm_shared::event::ActorEvent;
 use fvm_shared::sys::SendFlags;
 
 lazy_static::lazy_static! {
@@ -67,6 +68,7 @@ lazy_static::lazy_static! {
     pub static ref EVM_ACTOR_CODE_ID: Cid = make_identity_cid(b"fil/test/evm");
     pub static ref EAM_ACTOR_CODE_ID: Cid = make_identity_cid(b"fil/test/eam");
     pub static ref ETHACCOUNT_ACTOR_CODE_ID: Cid = make_identity_cid(b"fil/test/ethaccount");
+
     pub static ref ACTOR_TYPES: BTreeMap<Cid, Type> = {
         let mut map = BTreeMap::new();
         map.insert(*SYSTEM_ACTOR_CODE_ID, Type::System);
@@ -107,8 +109,6 @@ lazy_static::lazy_static! {
     ]
     .into_iter()
     .collect();
-    // TODO this is the other way around and will not work for wasm actors; the singletons must
-    //      be in a map, not the nonsingletons .
     pub static ref NON_SINGLETON_CODES: BTreeMap<Cid, ()> = {
         let mut map = BTreeMap::new();
         map.insert(*ACCOUNT_ACTOR_CODE_ID, ());
@@ -132,12 +132,6 @@ pub fn make_identity_cid(bz: &[u8]) -> Cid {
 /// Enable logging to enviornment. Returns error if already init.
 pub fn init_logging() -> Result<(), log::SetLoggerError> {
     pretty_env_logger::try_init()
-}
-
-pub struct ActorExit {
-    code: u32,
-    data: Option<IpldBlock>,
-    msg: Option<String>,
 }
 
 pub struct MockRuntime<BS = MemoryBlockstore> {
@@ -187,9 +181,6 @@ pub struct MockRuntime<BS = MemoryBlockstore> {
     pub actor_balances: HashMap<ActorID, TokenAmount>,
     pub tipset_timestamp: u64,
     pub tipset_cids: Vec<Cid>,
-
-    // actor exits
-    pub actor_exit: RefCell<Option<ActorExit>>,
 }
 
 #[derive(Default)]
@@ -234,6 +225,11 @@ impl Expectations {
             this.expect_validate_caller_addr.is_none(),
             "expected ValidateCallerAddr {:?}, not received",
             this.expect_validate_caller_addr
+        );
+        assert!(
+            this.expect_validate_caller_f4_namespace.is_none(),
+            "expected ValidateCallerF4Namespace {:?}, not received",
+            this.expect_validate_caller_f4_namespace
         );
         assert!(
             this.expect_validate_caller_type.is_none(),
@@ -321,10 +317,6 @@ impl Expectations {
             this.expect_emitted_events
         );
     }
-
-    fn skip_verification_on_drop(&mut self) {
-        self.skip_verification_on_drop = true;
-    }
 }
 
 impl Default for MockRuntime {
@@ -365,7 +357,6 @@ impl<BS> MockRuntime<BS> {
             actor_balances: Default::default(),
             tipset_timestamp: Default::default(),
             tipset_cids: Default::default(),
-            actor_exit: Default::default(),
         }
     }
 }
@@ -563,26 +554,7 @@ impl<BS: Blockstore> MockRuntime<BS> {
     ) -> Result<Option<IpldBlock>, ActorError> {
         self.in_call = true;
         let prev_state = self.state;
-        let res: Result<Option<IpldBlock>, ActorError> =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                A::invoke_method(self, method_num, params)
-            }))
-            .unwrap_or_else(|panic| {
-                if self.actor_exit.borrow().is_some() {
-                    let exit = self.actor_exit.take().unwrap();
-                    if exit.code == 0 {
-                        Ok(exit.data)
-                    } else {
-                        Err(ActorError::unchecked_with_data(
-                            ExitCode::new(exit.code),
-                            exit.msg.unwrap_or_else(|| "actor exited".to_owned()),
-                            exit.data,
-                        ))
-                    }
-                } else {
-                    std::panic::resume_unwind(panic)
-                }
-            });
+        let res = A::invoke_method(self, method_num, params);
 
         if res.is_err() {
             self.state = prev_state;
@@ -591,14 +563,13 @@ impl<BS: Blockstore> MockRuntime<BS> {
         res
     }
 
-    /// Verifies that all mock expectations have been met.
+    /// Verifies that all mock expectations have been met (and resets the expectations).
     pub fn verify(&mut self) {
         self.expectations.borrow_mut().verify()
     }
 
     /// Clears all mock expectations.
     pub fn reset(&mut self) {
-        self.expectations.borrow_mut().skip_verification_on_drop();
         self.expectations.borrow_mut().reset();
     }
 
@@ -1286,11 +1257,11 @@ impl<BS: Blockstore> Runtime for MockRuntime<BS> {
 
     fn tipset_cid(&self, epoch: i64) -> Result<Cid, ActorError> {
         let offset = self.epoch - epoch;
-        // Can't get tipset for epochs:
-        // - not current or future epoch
-        // - not negative
-        // - before current finality
-        if offset <= 0 || epoch < 0 || offset > 256 {
+        // Can't get tipset for:
+        // - current or future epochs
+        // - negative epochs
+        // - epochs beyond FINALITY of current epoch
+        if offset <= 0 || epoch < 0 || offset > self.policy.chain_finality {
             return Err(
                 actor_error!(illegal_argument; "invalid epoch to fetch tipset_cid {}", epoch),
             );
@@ -1309,11 +1280,6 @@ impl<BS: Blockstore> Runtime for MockRuntime<BS> {
         assert_eq!(*event, expected);
 
         Ok(())
-    }
-
-    fn exit(&self, code: u32, data: Option<IpldBlock>, msg: Option<&str>) -> ! {
-        self.actor_exit.replace(Some(ActorExit { code, data, msg: msg.map(|s| s.to_owned()) }));
-        std::panic::panic_any("actor exit");
     }
 
     fn chain_id(&self) -> ChainID {

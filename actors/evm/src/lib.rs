@@ -1,36 +1,30 @@
 use fil_actors_evm_shared::address::EthAddress;
 use fil_actors_evm_shared::uints::U256;
-use fil_actors_runtime::{actor_error, AsActorError, EAM_ACTOR_ADDR, INIT_ACTOR_ADDR};
+use fil_actors_runtime::{actor_error, ActorError, AsActorError, EAM_ACTOR_ADDR, INIT_ACTOR_ADDR};
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::ipld_block::IpldBlock;
-use fvm_ipld_encoding::{strict_bytes, BytesDe, BytesSer};
+use fvm_ipld_encoding::{BytesDe, BytesSer};
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
 
 use crate::interpreter::Outcome;
+use crate::interpreter::{execute, Bytecode, ExecutionState, System};
 use crate::reader::ValueReader;
+use cid::Cid;
+use fil_actors_runtime::runtime::{ActorCode, Runtime};
+use fvm_shared::{MethodNum, METHOD_CONSTRUCTOR};
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
+
+pub use types::*;
 
 #[doc(hidden)]
 pub mod ext;
 pub mod interpreter;
 pub(crate) mod reader;
 mod state;
-
-use {
-    crate::interpreter::{execute, Bytecode, ExecutionState, System},
-    bytes::Bytes,
-    cid::Cid,
-    fil_actors_runtime::{
-        runtime::{ActorCode, Runtime},
-        ActorError,
-    },
-    fvm_ipld_encoding::tuple::*,
-    fvm_ipld_encoding::RawBytes,
-    fvm_shared::{MethodNum, METHOD_CONSTRUCTOR},
-    num_derive::FromPrimitive,
-    num_traits::FromPrimitive,
-};
+mod types;
 
 pub use state::*;
 
@@ -132,8 +126,7 @@ fn initialize_evm_contract(
 
     // create a new execution context
     let value_received = system.rt.message().value_received();
-    let mut exec_state =
-        ExecutionState::new(caller, receiver_eth_addr, value_received, Bytes::new());
+    let mut exec_state = ExecutionState::new(caller, receiver_eth_addr, value_received, Vec::new());
 
     // identify bytecode valid jump destinations
     let initcode = Bytecode::new(initcode);
@@ -156,7 +149,7 @@ fn initialize_evm_contract(
 
 fn invoke_contract_inner<RT>(
     system: &mut System<RT>,
-    input_data: &[u8],
+    input_data: Vec<u8>,
     bytecode_cid: &Cid,
     caller: &EthAddress,
     value_received: TokenAmount,
@@ -176,7 +169,7 @@ where
     let receiver_eth_addr = system.resolve_ethereum_address(&receiver_fil_addr).unwrap();
 
     let mut exec_state =
-        ExecutionState::new(*caller, receiver_eth_addr, value_received, input_data.to_vec().into());
+        ExecutionState::new(*caller, receiver_eth_addr, value_received, input_data);
 
     let output = execute(&bytecode, &mut exec_state, system)?;
 
@@ -225,16 +218,10 @@ impl EvmContractActor {
         let mut system = System::load(rt).map_err(|e| {
             ActorError::unspecified(format!("failed to create execution abstraction layer: {e:?}"))
         })?;
-        invoke_contract_inner(
-            &mut system,
-            &params.input,
-            &params.code,
-            &params.caller,
-            params.value,
-        )
+        invoke_contract_inner(&mut system, params.input, &params.code, &params.caller, params.value)
     }
 
-    pub fn invoke_contract<RT>(rt: &mut RT, input_data: &[u8]) -> Result<Vec<u8>, ActorError>
+    pub fn invoke_contract<RT>(rt: &mut RT, input_data: Vec<u8>) -> Result<Vec<u8>, ActorError>
     where
         RT: Runtime,
         RT::Blockstore: Clone,
@@ -267,7 +254,7 @@ impl EvmContractActor {
     {
         let params = args.unwrap_or(IpldBlock { codec: 0, data: vec![] });
         let input = handle_filecoin_method_input(method, params.codec, params.data.as_slice());
-        let output = Self::invoke_contract(rt, &input)?;
+        let output = Self::invoke_contract(rt, input)?;
         handle_filecoin_method_output(&output)
     }
 
@@ -422,7 +409,7 @@ impl ActorCode for EvmContractActor {
                         p
                     }
                 };
-                let value = Self::invoke_contract(rt, &params)?;
+                let value = Self::invoke_contract(rt, params)?;
                 Ok(IpldBlock::serialize_cbor(&BytesSer(&value))?)
             }
             Some(Method::GetBytecode) => {
@@ -470,31 +457,4 @@ impl ActorCode for EvmContractActor {
             None => Err(actor_error!(unhandled_message; "Invalid method")),
         }
     }
-}
-
-#[derive(Serialize_tuple, Deserialize_tuple)]
-pub struct ConstructorParams {
-    /// The actor's "creator" (specified by the EAM).
-    pub creator: EthAddress,
-    /// The initcode that will construct the new EVM actor.
-    pub initcode: RawBytes,
-}
-
-pub type ResurrectParams = ConstructorParams;
-
-#[derive(Serialize_tuple, Deserialize_tuple)]
-pub struct DelegateCallParams {
-    pub code: Cid,
-    /// The contract invocation parameters
-    #[serde(with = "strict_bytes")]
-    pub input: Vec<u8>,
-    /// The original caller's Eth address.
-    pub caller: EthAddress,
-    /// The value passed in the original call.
-    pub value: TokenAmount,
-}
-
-#[derive(Serialize_tuple, Deserialize_tuple)]
-pub struct GetStorageAtParams {
-    pub storage_key: U256,
 }

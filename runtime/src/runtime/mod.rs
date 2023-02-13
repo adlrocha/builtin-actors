@@ -5,7 +5,6 @@ use cid::Cid;
 use fvm_ipld_blockstore::Blockstore;
 use fvm_ipld_encoding::CborStore;
 use fvm_shared::address::Address;
-use fvm_shared::chainid::ChainID;
 use fvm_shared::clock::ChainEpoch;
 use fvm_shared::consensus::ConsensusFault;
 use fvm_shared::crypto::hash::SupportedHashes;
@@ -13,7 +12,6 @@ use fvm_shared::crypto::signature::{
     Signature, SECP_PUB_LEN, SECP_SIG_LEN, SECP_SIG_MESSAGE_HASH_SIZE,
 };
 use fvm_shared::econ::TokenAmount;
-use fvm_shared::event::ActorEvent;
 use fvm_shared::piece::PieceInfo;
 use fvm_shared::randomness::RANDOMNESS_LENGTH;
 use fvm_shared::sector::{
@@ -47,6 +45,8 @@ pub(crate) mod empty;
 
 pub use empty::EMPTY_ARR_CID;
 use fvm_ipld_encoding::ipld_block::IpldBlock;
+use fvm_shared::chainid::ChainID;
+use fvm_shared::event::ActorEvent;
 use fvm_shared::sys::SendFlags;
 use multihash::Code;
 
@@ -65,7 +65,8 @@ pub trait Runtime: Primitives + Verifier + RuntimePolicy {
     /// The genesis block has epoch zero.
     fn curr_epoch(&self) -> ChainEpoch;
 
-    /// The ID for the EVM-based chain, as defined in https://github.com/ethereum-lists/chains.
+    /// The ID for this chain.
+    /// Filecoin chain IDs are usually in the Ethereum namespace, see: https://github.com/ethereum-lists/chains.
     fn chain_id(&self) -> ChainID;
 
     /// Validates the caller against some predicate.
@@ -74,7 +75,8 @@ pub trait Runtime: Primitives + Verifier + RuntimePolicy {
     fn validate_immediate_caller_is<'a, I>(&mut self, addresses: I) -> Result<(), ActorError>
     where
         I: IntoIterator<Item = &'a Address>;
-    /// Validates the caller is a member of a namespace.
+    /// Validates that the caller has a delegated address that is a member of
+    /// one of the provided namespaces.
     /// Addresses must be of Protocol ID.
     fn validate_immediate_caller_namespace<I>(
         &mut self,
@@ -250,10 +252,6 @@ pub trait Runtime: Primitives + Verifier + RuntimePolicy {
 
     /// Emits an event denoting that something externally noteworthy has ocurred.
     fn emit_event(&self, event: &ActorEvent) -> Result<(), ActorError>;
-
-    /// Exit the current computation with an error code and optionally data and a debugging
-    /// message.
-    fn exit(&self, code: u32, data: Option<IpldBlock>, msg: Option<&str>) -> !;
 
     /// Returns true if the call is read_only.
     /// All state updates, including actor creation and balance transfers, are rejected in read_only calls.

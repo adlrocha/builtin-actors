@@ -13,7 +13,8 @@ use fvm_shared::address::Address;
 use fvm_shared::bigint::BigInt;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
-use fvm_shared::{ActorID, MethodNum, Response, METHOD_CONSTRUCTOR};
+use fvm_shared::Response;
+use fvm_shared::{ActorID, MethodNum, METHOD_CONSTRUCTOR};
 use lazy_static::lazy_static;
 use log::info;
 use num_derive::FromPrimitive;
@@ -70,7 +71,7 @@ pub enum Method {
     DestroyExported = frc42_dispatch::method_hash!("Destroy"),
     NameExported = frc42_dispatch::method_hash!("Name"),
     SymbolExported = frc42_dispatch::method_hash!("Symbol"),
-    GranularityExported = frc42_dispatch::method_hash!("GranularityExported"),
+    GranularityExported = frc42_dispatch::method_hash!("Granularity"),
     TotalSupplyExported = frc42_dispatch::method_hash!("TotalSupply"),
     BalanceExported = frc42_dispatch::method_hash!("Balance"),
     TransferExported = frc42_dispatch::method_hash!("Transfer"),

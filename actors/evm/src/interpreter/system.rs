@@ -8,54 +8,43 @@ use fvm_ipld_blockstore::Block;
 use fvm_ipld_encoding::ipld_block::IpldBlock;
 use fvm_ipld_encoding::CborStore;
 use fvm_ipld_kamt::HashedKey;
-use fvm_shared::{
-    address::{Address, Payload},
-    crypto::hash::SupportedHashes,
-    econ::TokenAmount,
-    error::{ErrorNumber, ExitCode},
-    sys::SendFlags,
-    MethodNum, Response, IPLD_RAW, METHOD_SEND,
-};
+use fvm_shared::address::{Address, Payload};
+use fvm_shared::crypto::hash::SupportedHashes;
+use fvm_shared::econ::TokenAmount;
+use fvm_shared::error::{ErrorNumber, ExitCode};
+use fvm_shared::sys::SendFlags;
+use fvm_shared::{MethodNum, Response, IPLD_RAW, METHOD_SEND};
 use multihash::Code;
-use once_cell::unsync::OnceCell;
 
 use crate::state::{State, Tombstone};
 use crate::BytecodeHash;
 
-use {
-    cid::Cid,
-    fil_actors_runtime::{runtime::Runtime, ActorError},
-    fvm_ipld_blockstore::Blockstore,
-    fvm_ipld_kamt::{AsHashedKey, Config as KamtConfig, Kamt},
-};
+use cid::Cid;
+use fil_actors_runtime::{runtime::Runtime, ActorError};
+use fvm_ipld_blockstore::Blockstore;
+use fvm_ipld_kamt::{AsHashedKey, Config as KamtConfig, Kamt};
 
-lazy_static::lazy_static! {
-    // The Solidity compiler creates contiguous array item keys.
-    // To prevent the tree from going very deep we use extensions,
-    // which the Kamt supports and does in all cases.
-    //
-    // There are maximum 32 levels in the tree with the default bit width of 8.
-    // The top few levels will have a higher level of overlap in their hashes.
-    // Intuitively these levels should be used for routing, not storing data.
-    //
-    // The only exception to this is the top level variables in the contract
-    // which solidity puts in the first few slots. There having to do extra
-    // lookups is burdensome, and they will always be accessed even for arrays
-    // because that's where the array length is stored.
-    //
-    // However, for Solidity, the size of the KV pairs is 2x256, which is
-    // comparable to a size of a CID pointer plus extension metadata.
-    // We can keep the root small either by force-pushing data down,
-    // or by not allowing many KV pairs in a slot.
-    //
-    // The following values have been set by looking at how the charts evolved
-    // with the test contract. They might not be the best for other contracts.
-    static ref KAMT_CONFIG: KamtConfig = KamtConfig {
-        min_data_depth: 0,
-        bit_width: 5,
-        max_array_width: 1
-    };
-}
+// The Solidity compiler creates contiguous array item keys.
+// To prevent the tree from going very deep we use extensions,
+// which the Kamt supports and does in all cases.
+//
+// There are maximum 32 levels in the tree with the default bit width of 8.
+// The top few levels will have a higher level of overlap in their hashes.
+// Intuitively these levels should be used for routing, not storing data.
+//
+// The only exception to this is the top level variables in the contract
+// which solidity puts in the first few slots. There having to do extra
+// lookups is burdensome, and they will always be accessed even for arrays
+// because that's where the array length is stored.
+//
+// However, for Solidity, the size of the KV pairs is 2x256, which is
+// comparable to a size of a CID pointer plus extension metadata.
+// We can keep the root small either by force-pushing data down,
+// or by not allowing many KV pairs in a slot.
+//
+// The following values have been set by looking at how the charts evolved
+// with the test contract. They might not be the best for other contracts.
+const KAMT_CONFIG: KamtConfig = KamtConfig { min_data_depth: 0, bit_width: 5, max_array_width: 1 };
 
 pub struct StateHashAlgorithm;
 
@@ -103,17 +92,17 @@ pub struct System<'r, RT: Runtime> {
     /// The contract's EVM storage slots.
     slots: StateKamt<RT::Blockstore>,
     /// The contracts "nonce" (incremented when creating new actors).
-    nonce: u64,
+    pub(crate) nonce: u64,
     /// The last saved state root. None if the current state hasn't been saved yet.
     saved_state_root: Option<Cid>,
     /// Read Only context (staticcall)
     pub readonly: bool,
     /// Randomness taken from the current epoch of chain randomness
-    randomness: OnceCell<[u8; 32]>,
+    randomness: Option<[u8; 32]>,
 
     /// This is "some" if the actor is currently a "zombie". I.e., it has selfdestructed, but the
     /// current message is still executing. `System` cannot load a contracts state with a
-    tombstone: Option<Tombstone>,
+    pub(crate) tombstone: Option<Tombstone>,
 }
 
 impl<'r, RT: Runtime> System<'r, RT> {
@@ -129,7 +118,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
             saved_state_root: None,
             bytecode: None,
             readonly,
-            randomness: OnceCell::new(),
+            randomness: None,
             tombstone: None,
         }
     }
@@ -197,7 +186,7 @@ impl<'r, RT: Runtime> System<'r, RT> {
             saved_state_root: Some(state_root),
             bytecode: Some(EvmBytecode::new(state.bytecode, state.bytecode_hash)),
             readonly: read_only,
-            randomness: OnceCell::new(),
+            randomness: None,
             tombstone: state.tombstone,
         })
     }
@@ -441,14 +430,15 @@ impl<'r, RT: Runtime> System<'r, RT> {
     /// Gets the cached EVM randomness seed of the current epoch
     pub fn get_randomness(&mut self) -> Result<&[u8; 32], ActorError> {
         const ENTROPY: &[u8] = b"prevrandao";
-        self.randomness.get_or_try_init(|| {
+        match &mut self.randomness {
+            Some(rand) => Ok(&*rand),
             // get randomness from current beacon epoch with entropy of "prevrandao"
-            self.rt.get_randomness_from_beacon(
+            cache => Ok(cache.insert(self.rt.get_randomness_from_beacon(
                 fil_actors_runtime::runtime::DomainSeparationTag::EvmPrevRandao,
                 self.rt.curr_epoch(),
                 ENTROPY,
-            )
-        })
+            )?)),
+        }
     }
 
     /// Mark ourselves as "selfdestructed".

@@ -19,10 +19,9 @@ pub fn blockhash(
         .try_into()
         .ok()
         .filter(|&height: &ChainEpoch| {
-            // The EVM allows fetching blockhashes from the 256 _previous_ blocks.
-            // TODO: we can consider extending this to allow the full range.
-            // Also relates to https://github.com/filecoin-project/ref-fvm/issues/1023 (we might
-            // want to keep some of these restrictions).
+            // The EVM allows fetching blockhashes from the 256 _previous_ blocks, not including the
+            // current. The FVM allows fetching block CIDs from the last 899 epochs, not including
+            // the current epoch.
             let curr_epoch = system.rt.curr_epoch();
             height >= curr_epoch - 256 && height < curr_epoch
         })
@@ -153,7 +152,9 @@ mod tests {
     use crate::evm_unit_test;
     use cid::Cid;
     use fil_actors_evm_shared::uints::U256;
+    use fil_actors_runtime::EAM_ACTOR_ID;
     use fvm_ipld_encoding::{DAG_CBOR, IPLD_RAW};
+    use fvm_shared::address::Address as FilAddress;
 
     #[test]
     fn test_blockhash() {
@@ -330,5 +331,106 @@ mod tests {
                 assert_eq!(m.state.stack.pop().unwrap(), U256::from(10_000_000_000u64));
             };
         }
+    }
+
+    #[test]
+    fn test_address() {
+        evm_unit_test! {
+            (m) {
+                ADDRESS;
+            }
+            let addr = EthAddress::from_id(1001);
+            m.state.receiver = addr;
+            m.step().expect("execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), addr.as_evm_word());
+        };
+    }
+
+    #[test]
+    fn test_origin_id() {
+        let eth_addr = EthAddress::from_id(1000); // default origin in construction of rt in macro
+        let fil_addr = FilAddress::new_id(1000);
+        evm_unit_test! {
+            (rt) {
+                rt.in_call = true;
+                rt.set_origin(fil_addr);
+            }
+            (m) {
+                ORIGIN;
+            }
+            m.step().expect("execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), eth_addr.as_evm_word());
+        };
+    }
+
+    #[test]
+    fn test_origin_ethaddr() {
+        let addr_bytes = hex_literal::hex!("FEEDFACECAFEBEEF000000000000000000001234");
+        let eth_addr = EthAddress(addr_bytes);
+        let fil_addr = FilAddress::new_delegated(EAM_ACTOR_ID, &addr_bytes).unwrap();
+        evm_unit_test! {
+            (rt) {
+                rt.in_call = true;
+                rt.set_origin(fil_addr);
+            }
+            (m) {
+                ORIGIN;
+            }
+            m.step().expect("execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), eth_addr.as_evm_word());
+        };
+    }
+
+    #[test]
+    fn test_caller() {
+        evm_unit_test! {
+            (m) {
+                CALLER;
+            }
+            let addr = EthAddress::from_id(1001);
+            m.state.caller = addr;
+            m.step().expect("execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), addr.as_evm_word());
+        };
+    }
+
+    #[test]
+    fn test_gasprice() {
+        // Note: This is currently buggy, as the price needs to be capped by the MaxFeeCap.
+        evm_unit_test! {
+            (rt) {
+                rt.base_fee = TokenAmount::from_atto(1000);
+                rt.gas_premium = TokenAmount::from_atto(1234);
+            }
+            (m) {
+                GASPRICE;
+            }
+            let addr = EthAddress::from_id(1001);
+            m.state.caller = addr;
+            m.step().expect("execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), U256::from(2234));
+        };
+    }
+
+    #[test]
+    fn test_gas() {
+        evm_unit_test! {
+            (rt) {
+                rt.expect_gas_available(1234000);
+            }
+            (m) {
+                GAS;
+            }
+            let addr = EthAddress::from_id(1001);
+            m.state.caller = addr;
+            m.step().expect("execution step failed");
+            assert_eq!(m.state.stack.len(), 1);
+            assert_eq!(m.state.stack.pop().unwrap(), U256::from(1234000));
+        };
     }
 }
