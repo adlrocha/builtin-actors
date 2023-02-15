@@ -24,6 +24,7 @@ pub enum Type {
     EVM = 14,
     EAM = 15,
     EthAccount = 16,
+    IPCSubnetActor = 18,
 }
 
 impl Type {
@@ -45,6 +46,7 @@ impl Type {
             Type::EVM => "evm",
             Type::EAM => "eam",
             Type::EthAccount => "ethaccount",
+            Type::IPCSubnetActor => "ipc_subnet_actor",
         }
     }
 }
