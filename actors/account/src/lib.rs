@@ -34,6 +34,7 @@ pub enum Method {
     // Deprecated in v10
     // AuthenticateMessage = 3,
     AuthenticateMessageExported = frc42_dispatch::method_hash!("AuthenticateMessage"),
+    ResolvePubKeyAddress = frc42_dispatch::method_hash!("ResolvePubKeyAddress"),
 }
 
 /// Account Actor
@@ -111,6 +112,7 @@ impl ActorCode for Actor {
         Constructor => constructor,
         PubkeyAddress => pubkey_address,
         AuthenticateMessageExported => authenticate_message,
+        ResolvePubKeyAddress => pubkey_address,
         _ => fallback [raw],
     }
 }
